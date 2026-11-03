@@ -1,3 +1,2 @@
+# MediaPipe also installs OpenCV (opencv-contrib-python), which provides cv2.
 mediapipe>=0.10.30
-opencv-python
-pytest

@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import time
 import urllib.request
@@ -162,12 +163,20 @@ def main() -> None:
     args = parser.parse_args()
 
     landmarker = create_landmarker(ensure_model(args.model))
-    server = LineServer(args.host, args.port)
-    state = ArmState()
 
+    # Open the camera before listening, so the launcher only starts the sketch
+    # once the tracker can actually run.
     webcam = cv2.VideoCapture(args.camera)
     if not webcam.isOpened():
         raise SystemExit(f"Could not open camera {args.camera}")
+
+    server = LineServer(args.host, args.port)
+    state = ArmState()
+
+    # Tell launcher.py we are listening (it sets this variable).
+    ready_file = os.environ.get("VISUOCONTROL_READY_FILE")
+    if ready_file:
+        Path(ready_file).touch()
 
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     start = last = time.monotonic()
