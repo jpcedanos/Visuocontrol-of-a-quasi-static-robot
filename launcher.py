@@ -289,6 +289,8 @@ def main() -> None:
     if port_in_use():
         fail(f"Port {PORT} is already in use. Is the tracker already running in another window?")
 
+    # The sketch runs from .build/, so tell it where to save task attempts
+    os.environ["VISUOCONTROL_RECORDINGS"] = str(ROOT / "recordings")
     ready_file = BUILD.parent / "tracker.ready"
     ready_file.unlink(missing_ok=True)
     os.environ["VISUOCONTROL_READY_FILE"] = str(ready_file)

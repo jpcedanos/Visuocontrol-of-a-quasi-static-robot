@@ -5,7 +5,10 @@
 import processing.net.*;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.PrintWriter;
 import javax.imageio.ImageIO;
 
 PShape base, shoulder, upArm, loArm, end, table1, cube;
@@ -57,6 +60,7 @@ PMatrix3D cubeTilt = null;    // cube orientation while it falls after release (
 float pickX, pickY, pickZ;    // where the cube was when picked up
 float holdTime = 0;           // seconds since it was picked up (it slides into the fingers)
 final float SNAP_TIME = 0.15;
+boolean airborne = false;     // released and not yet landed
 
 final float GRAB_RADIUS = 14; // tip must be this close to the cube's centre to pick it up
 final float GRAVITY = 1500;   // scene units per second squared
@@ -104,6 +108,7 @@ void draw() {
   handleVideo();
   IK();
   updateCube(dt);
+  updateTask();
 
   layoutPanels();
   mainView = renderView(mainView, mainRect, mainRotX, mainRotY, 1.2);
@@ -118,6 +123,7 @@ void draw() {
   panelLabel(topRect, "View from above: depth");
   panelLabel(camRect, "Camera");
   drawStatusBar();
+  if (taskMode) drawTaskPanel();
   hint(ENABLE_DEPTH_TEST);
 }
 
@@ -138,7 +144,13 @@ void mouseDragged() {
 void keyPressed() {
   if (key == 'r' || key == 'R') {
     resetCube();
+    restartTask();
     showToast("Cube reset");
+  }
+  if (key == 't' || key == 'T') {
+    taskMode = !taskMode;
+    restartTask();
+    showToast(taskMode ? "Task mode: put the cube on the green square" : "Free play");
   }
   if (key == 'c' || key == 'C') {
     if (sendCommand("recenter")) showToast("Depth re-centered at your hand's current distance");
@@ -268,7 +280,7 @@ void drawStatusBar() {
   }
 
   fill(170);
-  String help = "c: re-center   k: calibrate   v: record   r: reset cube   drag: rotate";
+  String help = "t: task   r: reset   c: re-center   k: calibrate   v: record   drag: rotate";
   text(help, r[0] + r[2] - textWidth(help) - 12, y + 22);
 
   if (millis() < toastUntil) {
@@ -305,6 +317,7 @@ void drawWorld(PGraphics p, float rx, float ry, float zoom) {
   drawShadows(p);
   drawCube(p);
   drawTables(p);
+  if (taskMode) drawTargetZone(p);
   drawRoboticArm(p);
 }
 
@@ -596,6 +609,7 @@ void updateCube(float dt) {
 
   if (!holding && pinchStarted && tipNearCube()) {
     holding = true;
+    taskOnPickup();
     cubeTilt = null;
     pickX = posX;
     pickY = posY;
@@ -607,6 +621,7 @@ void updateCube(float dt) {
     cubeTilt = heldOrientation();
     cubeYaw = yawOf(cubeTilt);
     velY = 0;
+    airborne = true;
   }
 
   // Fingers: open, closed on the cube, or closed on nothing
@@ -633,8 +648,231 @@ void updateCube(float dt) {
     if (posY <= ground) {
       posY = ground;
       cubeTilt = null; // lands flat on its base, keeping its heading
+      if (airborne) taskOnLanding(ground);
+      airborne = false;
       velY = -velY * BOUNCE;
       if (abs(velY) < 40) velY = 0; // settle instead of bouncing forever
     }
   }
+}
+
+//-------------------TASK MODE-------------------//
+// Move the cube onto the green square on the other table. The timer starts
+// when you pick the cube up; after a success the square moves to the other
+// table. Each attempt is recorded frame by frame, and summarized in
+// recordings/attempts.csv.
+
+boolean taskMode = true;
+int targetSide = 1;                 // the square is on the table at scene x = 62 * targetSide
+final float TARGET_X = 62, ZONE_HALF = 11;
+final float ZONE_TOLERANCE = 8;     // cube centre within this of the square's centre counts
+final int RESULT_MS = 3000;         // how long the result card stays up
+
+final int WAITING = 0, RUNNING = 1, DONE = 2;
+int phase = WAITING;
+int attemptNumber = 1;
+int attemptStart, phaseSince;
+int pickups, floorDrops;
+float pathLength, straightLine;
+float lastTipX, lastTipY, lastTipZ;
+float lastSeconds = 0, bestSeconds = -1;
+boolean lastWasBest = false;
+PrintWriter attemptLog;
+String attemptFile = "";
+
+float targetX() { return TARGET_X * targetSide; }
+
+String recordingsDir() {
+  String dir = System.getenv("VISUOCONTROL_RECORDINGS"); // set by the launcher
+  return dir != null ? dir : sketchPath("recordings");
+}
+
+void restartTask() {
+  closeAttemptLog(false);
+  phase = WAITING;
+  phaseSince = millis();
+  // the square goes on the table the cube is not on
+  targetSide = posX < 0 ? 1 : -1;
+}
+
+void taskOnPickup() {
+  if (!taskMode) return;
+  if (phase == DONE) nextAttempt(); // picked up again while the result is showing
+  if (phase == WAITING) startAttempt();
+  if (phase == RUNNING) pickups++;
+}
+
+void taskOnLanding(float ground) {
+  if (taskMode && phase == RUNNING && ground == FLOOR_Y) floorDrops++;
+}
+
+void startAttempt() {
+  phase = RUNNING;
+  attemptStart = phaseSince = millis();
+  pickups = 0;
+  floorDrops = 0;
+  pathLength = 0;
+  lastTipX = tipX; lastTipY = tipY; lastTipZ = tipZ;
+  // straight line from the cube's centre to where its centre ends up on the square
+  straightLine = dist(posX, posY + CUBE_HEIGHT / 2, posZ, targetX(), TABLE_TOP + CUBE_HEIGHT / 2, 0);
+  openAttemptLog();
+}
+
+boolean cubeOnTarget() {
+  return !holding && !airborne && velY == 0 && abs(posY - TABLE_TOP) < 0.5
+      && dist(posX, posZ, targetX(), 0) <= ZONE_TOLERANCE;
+}
+
+void updateTask() {
+  if (!taskMode) return;
+  if (phase == RUNNING) {
+    pathLength += dist(tipX, tipY, tipZ, lastTipX, lastTipY, lastTipZ);
+    lastTipX = tipX; lastTipY = tipY; lastTipZ = tipZ;
+    logFrame();
+    if (cubeOnTarget()) finishAttempt();
+  } else if (phase == DONE && millis() - phaseSince > RESULT_MS) {
+    nextAttempt();
+  }
+}
+
+void nextAttempt() {
+  attemptNumber++;
+  targetSide = -targetSide; // back to the other table
+  phase = WAITING;
+  phaseSince = millis();
+}
+
+// Processing calls this when the window closes: keep what was recorded, then
+// let Processing shut down as usual
+void dispose() {
+  closeAttemptLog(false);
+  super.dispose();
+}
+
+void finishAttempt() {
+  lastSeconds = (millis() - attemptStart) / 1000.0;
+  lastWasBest = bestSeconds < 0 || lastSeconds < bestSeconds;
+  if (lastWasBest) bestSeconds = lastSeconds;
+  phase = DONE;
+  phaseSince = millis();
+  closeAttemptLog(true);
+}
+
+float efficiency() {
+  return pathLength > 0 ? min(1, straightLine / pathLength) : 0;
+}
+
+// ---- recording ----
+
+void openAttemptLog() {
+  try {
+    File dir = new File(recordingsDir());
+    dir.mkdirs();
+    attemptFile = "attempt_" + nf(year(), 4) + nf(month(), 2) + nf(day(), 2) + "_"
+                + nf(hour(), 2) + nf(minute(), 2) + nf(second(), 2) + ".csv";
+    attemptLog = new PrintWriter(new FileWriter(new File(dir, attemptFile)));
+    attemptLog.println("t,target_x,target_y,target_z,roll,grab,base,shoulder,elbow,wrist,gripper,"
+                     + "tip_x,tip_y,tip_z,cube_x,cube_y,cube_z,cube_yaw,holding");
+  }
+  catch (IOException e) {
+    attemptLog = null;
+    showToast("Could not write to " + recordingsDir());
+  }
+}
+
+void logFrame() {
+  if (attemptLog == null) return;
+  float t = (millis() - attemptStart) / 1000.0;
+  attemptLog.println(nf(t, 1, 3) + "," + coordX + "," + coordY + "," + coordZ + "," + wristRoll + ","
+    + (grabbed ? 1 : 0) + "," + gamma + "," + alpha + "," + beta + "," + wristRoll + "," + gripGap + ","
+    + tipX + "," + tipY + "," + tipZ + "," + posX + "," + posY + "," + posZ + "," + cubeYaw + "," + (holding ? 1 : 0));
+}
+
+// Close the frame log; on success also add a row to attempts.csv
+void closeAttemptLog(boolean success) {
+  if (attemptLog == null) return;
+  attemptLog.close();
+  attemptLog = null;
+  if (!success) return;
+  try {
+    File summary = new File(recordingsDir(), "attempts.csv");
+    boolean header = !summary.exists();
+    PrintWriter w = new PrintWriter(new FileWriter(summary, true));
+    if (header) w.println("finished,attempt,seconds,pickups,floor_drops,path_length,straight_line,path_efficiency,target_table,frames_file");
+    w.println(nf(year(), 4) + "-" + nf(month(), 2) + "-" + nf(day(), 2) + " " + nf(hour(), 2) + ":" + nf(minute(), 2) + ":" + nf(second(), 2)
+      + "," + attemptNumber + "," + nf(lastSeconds, 1, 2) + "," + pickups + "," + floorDrops + ","
+      + nf(pathLength, 1, 1) + "," + nf(straightLine, 1, 1) + "," + nf(efficiency(), 1, 3) + ","
+      + (targetSide > 0 ? "left" : "right") + "," + attemptFile);
+    w.close();
+  }
+  catch (IOException e) {
+    showToast("Could not write attempts.csv");
+  }
+}
+
+// ---- drawing ----
+
+// Green square on the target table, in the scene
+void drawTargetZone(PGraphics p) {
+  float x = targetX(), y = TABLE_TOP + 0.2;
+  boolean done = phase == DONE;
+  p.fill(done ? color(90, 255, 120) : color(40, 200, 90));
+  float w = ZONE_HALF * 2, t = 1.2;
+  p.pushMatrix();
+  p.translate(x, y, 0);
+  for (int i = 0; i < 4; i++) { // the square's four edges
+    p.pushMatrix();
+    p.rotateY(HALF_PI * i);
+    p.translate(0, 0, ZONE_HALF - t / 2);
+    p.box(w, 0.3, t);
+    p.popMatrix();
+  }
+  p.fill(40, 200, 90, 60);
+  p.box(w - 2 * t, 0.1, w - 2 * t);
+  p.popMatrix();
+}
+
+// Timer and result card, top centre of the front view
+void drawTaskPanel() {
+  int[] r = mainRect;
+  float cx = r[0] + r[2] / 2;
+  String line;
+  if (phase == WAITING) {
+    line = "Attempt " + attemptNumber + ":  pick up the cube and put it on the green square";
+  } else if (phase == RUNNING) {
+    float t = (millis() - attemptStart) / 1000.0;
+    line = "Attempt " + attemptNumber + "   " + nf(t, 1, 1) + " s   pickups " + pickups + "   drops " + floorDrops;
+  } else {
+    line = "Attempt " + attemptNumber + " done";
+  }
+  if (bestSeconds > 0 && phase != DONE) line += "   best " + nf(bestSeconds, 1, 1) + " s";
+  float w = textWidth(line) + 28;
+  noStroke();
+  fill(0, 170);
+  rect(cx - w / 2, r[1] + 8, w, 30, 6);
+  fill(phase == RUNNING ? color(255, 220, 120) : color(230));
+  textAlign(CENTER, CENTER);
+  text(line, cx, r[1] + 23);
+
+  if (phase == DONE) {
+    String[] rows = {
+      (lastWasBest ? "New best!  " : "Done!  ") + nf(lastSeconds, 1, 1) + " s",
+      pickups + (pickups == 1 ? " pickup" : " pickups") + "   " + floorDrops + (floorDrops == 1 ? " drop" : " drops"),
+      "Path efficiency " + round(efficiency() * 100) + "%  (straight line " + round(straightLine) + " / travelled " + round(pathLength) + ")",
+      "Next: back to the other table"
+    };
+    float cw = 0;
+    for (String row : rows) cw = max(cw, textWidth(row));
+    cw += 48;
+    float ch = 34 * rows.length + 20, cy = r[1] + r[3] * 0.32;
+    fill(0, 200);
+    rect(cx - cw / 2, cy - ch / 2, cw, ch, 10);
+    for (int i = 0; i < rows.length; i++) {
+      fill(i == 0 ? color(110, 240, 130) : color(225));
+      textSize(i == 0 ? 22 : 15);
+      text(rows[i], cx, cy - ch / 2 + 27 + 34 * i);
+    }
+    textSize(14);
+  }
+  textAlign(LEFT, BASELINE);
 }

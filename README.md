@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/jpcedanos/Visuocontrol-of-a-quasi-static-robot/actions/workflows/ci.yml/badge.svg)](https://github.com/jpcedanos/Visuocontrol-of-a-quasi-static-robot/actions/workflows/ci.yml)
 
-Control a simulated robotic arm with one hand. A webcam tracks your hand with MediaPipe, and a Processing sketch moves a 3-DOF arm (base, shoulder, elbow) with inverse kinematics. Pinch to pick up a Rubik's cube, carry it, and let go: it falls onto a table or the floor.
+Control a simulated robotic arm with one hand. A webcam tracks your hand with MediaPipe, and a Processing sketch moves a 4-DOF arm (base, shoulder and elbow by inverse kinematics, plus a wrist you turn by turning your hand) with a two-finger gripper. Pinch to pick up a Rubik's cube, carry it, turn it, and let go: it falls onto a table or the floor. A task mode times you moving the cube between tables and records every attempt.
 
 <!-- Add a demo here: screen-record the Visuocontrol window and save it as docs/demo.gif -->
 <!-- ![Demo](docs/demo.gif) -->
@@ -12,23 +12,25 @@ Control a simulated robotic arm with one hand. A webcam tracks your hand with Me
 ```mermaid
 flowchart LR
     WEB[Webcam] --> PY[hand_detector.py<br/>OpenCV + MediaPipe Hand Landmarker<br/>TCP server :65432]
-    PY -- ":65432  x,y,z,grab (one line per frame)" --> PDE[robotic_arm.pde<br/>Processing 3D + IK<br/>one window, three panels]
+    PY -- ":65432  x,y,z,grab,mode,roll (one line per frame)" --> PDE[robotic_arm.pde<br/>Processing 3D + IK<br/>one window, three panels]
     PY -- ":65433  camera preview (JPEG frames)" --> PDE
-    PDE -. "recenter (key c)" .-> PY
+    PDE -. "recenter / calibrate / record (keys c, k, v)" .-> PY
 ```
 
 - **Hand tracking (`hand_detector.py`):** MediaPipe's Hand Landmarker finds 21 landmarks on your hand in each frame.
 - **One-hand control (`gestures.py`):**
   - The **palm centre** (wrist and knuckles) moves the arm left/right and up/down. Fingers don't affect it, so pinching doesn't drag the arm.
   - The **apparent size of your hand** sets depth. Moving it toward the camera reaches deeper into the scene. How much depends on a short [calibration](#calibration) of your camera and distance.
+  - **Turning your hand** like a dial turns the wrist (and a held cube). It uses the wrist-to-knuckle direction, so it works with either hand and pinching doesn't change it; turns under 10° are ignored and the wrist stops at ±80°.
   - A **pinch** (thumb and index tips together) grabs. It closes below 0.25 palm sizes and opens above 0.40, so it doesn't flicker at the edge.
   - With several hands in view, it keeps following the one it started with.
   - Positions go through a **One Euro filter**, the usual choice for hand tracking: it smooths heavily while your hand is still and very little while it moves. In the tests it leaves 36% of the jitter of a still hand (a plain 50% moving average leaves 57%) and lags 4.2 units at 200 units/s (the average lags 6.7).
-- **Streaming:** the tracker runs a TCP server on `127.0.0.1:65432` and sends one newline-terminated `x,y,z,grab,mode` line per frame, plus the camera preview on port 65433. The sketch sends back short commands when you press keys.
+- **Streaming:** the tracker runs a TCP server on `127.0.0.1:65432` and sends one newline-terminated `x,y,z,grab,mode,roll` line per frame, plus the camera preview on port 65433. The sketch sends back short commands when you press keys.
 - **Simulation (`robotic_arm.pde`):**
-  - Solves the three joint angles in closed form (law of cosines and `atan2`). Out-of-reach targets leave the arm stretched toward them.
-  - Picks up the cube when a pinch **starts** with the arm tip at the cube, like a real gripper. The cube then follows the tip.
-  - When you let go, the cube falls under gravity and lands on a table top or the floor, with a small bounce.
+  - Solves the base, shoulder and elbow angles in closed form (law of cosines and `atan2`) so the tool tip reaches the target. Out-of-reach targets leave the arm stretched toward them.
+  - A two-finger **gripper** opens, closes on the cube, or closes fully when you pinch on nothing.
+  - Picks up the cube when a pinch **starts** with the tool tip at the cube, like a real gripper. The cube slides between the fingers, then moves and turns with them.
+  - When you let go, the cube falls (at the angle the gripper held it) and lands flat on a table top or the floor, with a small bounce, keeping its heading.
   - Shadows under the cube and the arm tip show where they are above the ground, which helps to judge depth.
   - Everything is in **one window** that opens centered and sized to your screen:
 
@@ -127,10 +129,12 @@ The two programs can start in any order. The sketch retries the connection every
 | Move your hand toward / away from the camera | Arm reaches deeper / comes nearer |
 | Pinch thumb and index (at the cube) | Grabs the cube |
 | Open the pinch | Drops the cube |
+| Turn your hand like a dial | Turns the wrist and the cube it holds |
+| `t` | Task mode on / off (on by default) |
 | `c` | Re-centers depth at your hand's current distance |
 | `k` | Runs the depth calibration again |
 | `v` | Starts / stops recording the session |
-| `r` | Puts the cube back on its table |
+| `r` | Puts the cube back on its table (and restarts the attempt) |
 | Drag the mouse on a 3D view | Rotates that view |
 | Close the window | Quits (the launcher stops the tracker too) |
 
@@ -144,11 +148,24 @@ Tips:
 
 Cameras and seating distances differ a lot in how much bigger your hand looks when you move it closer. The first time you launch (or when you press `k`), the camera panel walks you through three steps:
 
-1. Hold your hand still at a comfortable distance. This becomes the middle depth.
+1. Hold your hand still at a comfortable distance, upright. Its position becomes the middle of the workspace, its size the middle depth, and its angle the straight wrist.
 2. Move it closer to the camera and hold.
 3. Move it farther away than at the start and hold.
 
 Each step waits until your hand is steady for 0.8 s, with a progress bar. The arm holds still meanwhile. The result (`calibration.json`) sets the depth sensitivity so that your closest and farthest positions reach 90% of the workspace, and it's reused next time.
+
+## Task mode
+
+The front view shows a green square on the other table. Move the cube onto it:
+
+- The timer starts when you pick the cube up and stops when the cube rests on the square.
+- The result card shows the time, pickups, drops to the floor, and **path efficiency**: the straight-line distance from where the cube was to the square, divided by the distance the gripper actually travelled.
+- Then the square moves to the other table, so you keep going back and forth. `r` puts the cube back and restarts; `t` switches to free play.
+
+Every attempt is recorded automatically in `recordings/`:
+
+- `attempts.csv`: one row per completed attempt (time, pickups, drops, path length, straight line, efficiency, which table, frames file). Open it in Excel or pandas to see how you improve.
+- `attempt_<date>_<time>.csv`: every frame of that attempt: the target sent by the tracker, the joint angles (`base`, `shoulder`, `elbow`, `wrist`), the gripper opening, the tool tip, and the cube's position and heading. These are the same observations and actions a robot-learning dataset uses, so they carry over to a MuJoCo version.
 
 ## Recordings and replay
 
