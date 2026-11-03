@@ -1,6 +1,6 @@
 # Visuocontrol of a quasi-static robot
 
-Control a simulated 6-DOF robotic arm with your hand. A webcam tracks your hand with MediaPipe, and a Processing sketch moves the arm in 3D with inverse kinematics. Close your fist to grab a cube.
+Control a simulated 6-DOF robotic arm with your hands. A webcam tracks both hands with MediaPipe, and a Processing sketch moves the arm in 3D with inverse kinematics. Close your fist to grab a cube.
 
 <!-- Add a demo here: screen-record both windows and save it as docs/demo.gif -->
 <!-- ![Demo](docs/demo.gif) -->
@@ -9,49 +9,63 @@ Control a simulated 6-DOF robotic arm with your hand. A webcam tracks your hand 
 
 ```mermaid
 flowchart LR
-    WEB[Webcam] --> PY[hand_detector.py<br/>OpenCV + MediaPipe<br/>TCP server :65432]
-    PY -- "x, y, z, fist_closed" --> PDE[robotic_arm.pde<br/>Processing 3D + IK<br/>TCP client]
+    WEB[Webcam] --> PY[hand_detector.py<br/>OpenCV + MediaPipe Hand Landmarker<br/>TCP server :65432]
+    PY -- "x,y,z,grab\n (one line per frame)" --> PDE[robotic_arm.pde<br/>Processing 3D + IK<br/>TCP client]
 ```
 
-- **Hand tracking (`hand_detector.py`):** MediaPipe Hands finds the hand landmarks in each frame.
-  - Wrist position sets the arm's target X and Y.
-  - Thumb up or thumb down moves the target Z up or down.
-  - A closed fist is the grab signal.
-- **Streaming:** the Python script runs a TCP server on `127.0.0.1:65432` and sends `x,y,z,fist_closed` each frame.
-- **Simulation (`robotic_arm.pde`):** Processing connects as a client, solves the joint angles in closed form (law of cosines and `atan2`), and renders the arm, a table, and a cube from OBJ models. If the hand is closed while the arm touches the cube, the arm picks it up.
+- **Hand tracking (`hand_detector.py`):** MediaPipe's Hand Landmarker finds 21 landmarks per hand in each frame.
+  - **Left hand:** wrist position sets the arm's target X and Y. Closing the fist grabs the cube.
+  - **Right hand:** thumbs-up raises the arm, thumbs-down lowers it, at a constant speed while the gesture is held.
+- **Gesture rules (`gestures.py`):** a hand counts as a fist when every fingertip is closer to the wrist than its middle joint, so it works whatever way the hand is turned. A thumb gesture needs the other four fingers curled, so an open hand never moves the arm.
+- **Streaming:** the tracker runs a TCP server on `127.0.0.1:65432` and sends one newline-terminated `x,y,z,grab` line per frame.
+- **Simulation (`robotic_arm.pde`):** Processing connects as a client, solves the joint angles in closed form (law of cosines and `atan2`), and renders the arm, two tables, and a cube from OBJ models. If the hand is closed while the arm touches the cube, the cube follows the arm. Targets out of reach leave the arm fully stretched toward them.
 
 ## Requirements
 
-- [Processing](https://processing.org/) (uses the built-in `processing.net` library)
-- Python 3 with `opencv-python`, `mediapipe`, and `numpy`:
+- [Processing 4](https://processing.org/) (uses the built-in `processing.net` library)
+- Python 3.9+:
   ```bash
-  pip install opencv-python mediapipe numpy
+  pip install -r requirements.txt
   ```
+
+The first run downloads MediaPipe's hand model (about 8 MB) into `models/`.
 
 ## Running
 
 1. Clone the repo:
    ```bash
-   git clone https://github.com/jpcedano/Visuocontrol-of-a-quasi-static-robot.git
+   git clone https://github.com/jpcedanos/Visuocontrol-of-a-quasi-static-robot.git
    cd Visuocontrol-of-a-quasi-static-robot
    ```
-2. Start the hand tracker first, since it's the server:
+2. Start the hand tracker:
    ```bash
    python hand_detector.py
    ```
-3. Open `robotic_arm.pde` in Processing and press Run. It connects to the tracker and opens the 3D view.
+   Options: `--camera N` to pick another webcam, `--host` / `--port` to change the address.
+3. Open `robotic_arm.pde` in Processing and press Run.
 
-`cliente_temporal.py` is a small debug client that prints the coordinate stream without the simulation.
+The two programs can start in any order. The sketch retries the connection every 2 seconds, and the tracker accepts a new connection if the sketch is restarted.
+
+`debug_client.py` prints the stream without the simulation, which is handy for checking the tracker on its own.
 
 ## Controls
 
 | Input | Effect |
 |---|---|
-| Move your wrist | Moves the arm in X and Y |
-| Thumb up / thumb down | Raises / lowers the arm (Z) |
-| Close your fist | Grabs the cube when the arm is touching it |
+| Move your left wrist | Moves the arm in X and Y |
+| Close your left fist | Grabs the cube when the arm is touching it |
+| Right hand thumbs-up / thumbs-down | Raises / lowers the arm (Z) |
 | Drag the mouse | Rotates the camera in the Processing window |
+| `q` in the camera window | Quits the tracker |
+
+## Tests
+
+The gesture rules and arm-state logic are covered by unit tests with synthetic hands, so they run without a camera:
+
+```bash
+python -m pytest
+```
 
 ## Built with
 
-OpenCV · MediaPipe · Processing (OpenGL)
+OpenCV · MediaPipe Tasks · Processing (OpenGL)

@@ -11,6 +11,8 @@ float T = 70;
 Client client;
 String serverIP = "127.0.0.1";
 int serverPort = 65432;
+int lastConnectAttempt = 0;
+final int RECONNECT_MS = 2000;
 float coordX, coordY, coordZ;
 String mano_cerrada = "False";
 boolean grabbed = false;
@@ -22,7 +24,7 @@ void setup() {
 
   initializeShapes();
 
-  client = new Client(this, serverIP, serverPort);
+  connect();
 
   // Open a duplicate window
   DuplicateWindow duplicate = new DuplicateWindow();
@@ -41,7 +43,7 @@ void draw() {
     posZ = -coordX;
   }
 
-  writePos();
+  IK();
   renderScene();
 }
 
@@ -130,10 +132,28 @@ void renderRoboticArm() {
 
 //-------------------CLIENT COMMUNICATION FUNCTIONS-------------------//
 
+void connect() {
+  client = new Client(this, serverIP, serverPort);
+  lastConnectAttempt = millis();
+}
+
 void handleClientData() {
-  String data = client.readString();
-  if (data != null) {
-    parseCoordinates(data);
+  // Retry every couple of seconds, so the sketch and the hand tracker
+  // can be started in any order and either one can be restarted.
+  if (client == null || !client.active()) {
+    if (millis() - lastConnectAttempt > RECONNECT_MS) connect();
+    return;
+  }
+  // The tracker sends one "x,y,z,grab" line per frame. TCP can split or merge
+  // those lines, so read whole lines only and keep the newest one.
+  String latest = null;
+  while (client.available() > 0) {
+    String line = client.readStringUntil('\n');
+    if (line == null) break; // partial line: wait for the rest
+    latest = line;
+  }
+  if (latest != null) {
+    parseCoordinates(latest);
   }
 }
 
@@ -151,12 +171,6 @@ void parseCoordinates(String data) {
   }
 }
 
-void writePos() {
-  IK();
-  String message = coordX + "," + coordY + "," + coordZ + "," + mano_cerrada;
-  client.write(message);
-}
-
 //-------------------KINEMATICS AND LOGIC FUNCTIONS-------------------//
 
 void IK() {
@@ -167,8 +181,13 @@ void IK() {
   float L = sqrt(Y * Y + X * X);
   float dia = sqrt(Z * Z + L * L);
 
-  alpha = PI / 2 - (atan2(L, Z) + acos((T * T - F * F - dia * dia) / (-2 * F * dia)));
-  beta = -PI + acos((dia * dia - T * T - F * F) / (-2 * F * T));
+  // The arm can only reach distances between |T - F| and T + F. Outside that
+  // range acos() returns NaN and the arm disappears, so clamp the distance:
+  // an unreachable target leaves the arm fully stretched toward it.
+  dia = constrain(dia, abs(T - F) + 0.01, T + F - 0.01);
+
+  alpha = PI / 2 - (atan2(L, Z) + acos(constrain((T * T - F * F - dia * dia) / (-2 * F * dia), -1, 1)));
+  beta = -PI + acos(constrain((dia * dia - T * T - F * F) / (-2 * F * T), -1, 1));
   gamma = atan2(Y, X);
 }
 

@@ -1,172 +1,209 @@
+"""Track both hands with a webcam and stream an arm target to the Processing sketch.
+
+- Left hand: wrist position moves the arm in X/Y; a closed fist grabs the cube.
+- Right hand: thumbs-up raises the arm, thumbs-down lowers it.
+
+The script runs a TCP server and sends one line per frame:
+``x,y,z,grab\\n``. The Processing sketch connects as a client, and can be
+started or restarted at any time.
+
+Usage:
+    python hand_detector.py [--camera 0] [--host 127.0.0.1] [--port 65432]
+"""
+
+from __future__ import annotations
+
+import argparse
+import socket
+import time
+import urllib.request
+from pathlib import Path
+
 import cv2
 import mediapipe as mp
-import numpy as np
-import socket
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python import vision
 
-HOST = '127.0.0.1'
-PORT = 65432
+from gestures import HAND_CONNECTIONS, WRIST, ArmState, is_fist, thumb_gesture
 
-z=0.0
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/latest/hand_landmarker.task"
+)
+DEFAULT_MODEL = Path(__file__).parent / "models" / "hand_landmarker.task"
+WINDOW = "Hand tracking (q to quit)"
 
-# Inicializar los módulos de MediaPipe para la detección de manos
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
 
-# Función para determinar el gesto del pulgar
-def detect_thumb_gesture(hand_landmarks):
-    thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
-    thumb_ip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_IP]
-    wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
-    
-    # Calcular la diferencia vertical entre el pulgar y la muñeca
-    thumb_up = thumb_tip.y < wrist.y and thumb_ip.y < wrist.y
-    thumb_down = thumb_tip.y > wrist.y and thumb_ip.y > wrist.y
-    
-    if thumb_up:
-        return "Thumb Up"
-    elif thumb_down:
-        return "Thumb Down"
-    else:
-        return "Neutral"
-    
-def is_hand_closed(hand_landmarks):
-    """Determina si la mano está cerrada en un puño."""
-    tips_ids = [mp_hands.HandLandmark.INDEX_FINGER_TIP, 
-                mp_hands.HandLandmark.MIDDLE_FINGER_TIP, 
-                mp_hands.HandLandmark.RING_FINGER_TIP, 
-                mp_hands.HandLandmark.PINKY_TIP]
-    mcp_ids = [mp_hands.HandLandmark.INDEX_FINGER_MCP, 
-               mp_hands.HandLandmark.MIDDLE_FINGER_MCP, 
-               mp_hands.HandLandmark.RING_FINGER_MCP, 
-               mp_hands.HandLandmark.PINKY_MCP]
-    
-    closed = "True"
-    for tip_id, mcp_id in zip(tips_ids, mcp_ids):
-        if hand_landmarks.landmark[tip_id].y < hand_landmarks.landmark[mcp_id].y:
-            closed = "False"
-            break
-    
-    return closed
+def ensure_model(path: Path) -> Path:
+    """Download the MediaPipe hand model the first time the script runs."""
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading hand model to {path} ...")
+        urllib.request.urlretrieve(MODEL_URL, path)
+    return path
 
-# Función para detectar las manos en la imagen de la cámara
-def detect_hands(webcam, conn):
 
-    global z
+def create_landmarker(model_path: Path, running_mode=vision.RunningMode.VIDEO) -> vision.HandLandmarker:
+    options = vision.HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(model_path)),
+        running_mode=running_mode,
+        num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return vision.HandLandmarker.create_from_options(options)
 
-    # Obtener las dimensiones de las ventanas
-    window_width = 1200  # Ancho deseado de las ventanas
-    window_height = 800  # Alto deseado de las ventanas
 
-    # Crear una nueva ventana para mostrar la imagen de la cámara
-    cv2.namedWindow('Detección de Manos', cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('Detección de Manos', window_width, window_height)
+class LineServer:
+    """TCP server that accepts one client at a time without blocking the camera loop."""
 
-    # Obtener el tamaño de la ventana después de haberla creado
-    actual_window_width = cv2.getWindowImageRect('Detección de Manos')[2]
-    actual_window_height = cv2.getWindowImageRect('Detección de Manos')[3]
+    def __init__(self, host: str, port: int):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((host, port))
+        self.sock.listen(1)
+        self.sock.setblocking(False)
+        self.client: socket.socket | None = None
+        print(f"Waiting for the Processing sketch on {host}:{port}")
 
-    # Establecer el tamaño de la cámara para que coincida con el tamaño de la ventana
-    webcam.set(cv2.CAP_PROP_FRAME_WIDTH, actual_window_width)
-    webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, actual_window_height)
+    def _accept(self) -> None:
+        try:
+            conn, addr = self.sock.accept()
+        except BlockingIOError:
+            return
+        conn.setblocking(True)
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.client = conn
+        print(f"Sketch connected from {addr[0]}:{addr[1]}")
 
-    # Iniciar el bucle para capturar frames de la cámara
-    with mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.2, min_tracking_confidence=0.3) as hands:
-        while webcam.isOpened():
-            success, image = webcam.read()
-            if not success:
-                print("No se pudo leer el frame de la cámara.")
+    def send(self, line: str) -> None:
+        if self.client is None:
+            self._accept()
+        if self.client is None:
+            return
+        try:
+            self.client.sendall(line.encode())
+        except OSError:
+            print("Sketch disconnected; waiting for it to reconnect")
+            self.client.close()
+            self.client = None
+
+    @property
+    def connected(self) -> bool:
+        return self.client is not None
+
+    def close(self) -> None:
+        if self.client:
+            self.client.close()
+        self.sock.close()
+
+
+def user_side(category_name: str) -> str:
+    """Which of the user's hands MediaPipe saw, given a mirrored frame.
+
+    The HandLandmarker task labels hands correctly on an unmirrored camera
+    image. We run it on the mirrored frame (so the overlay and the X axis
+    behave like a mirror), which flips its labels, so swap them back.
+    The legacy ``mp.solutions.hands`` API behaved the other way round, which
+    is why the original script did not need this.
+    """
+    return {"Left": "Right", "Right": "Left"}.get(category_name, category_name)
+
+
+def apply_result(result, state: ArmState, width: int, height: int, dt: float) -> dict[str, str]:
+    """Update the arm state from one HandLandmarker result on a mirrored frame.
+
+    Returns the gesture shown for each detected hand, for the on-screen overlay.
+    If the left hand is not visible, the arm keeps its last position and
+    releases the cube.
+    """
+    labels: dict[str, str] = {}
+    left_seen = False
+    for landmarks, handedness in zip(result.hand_landmarks, result.handedness):
+        side = user_side(handedness[0].category_name)
+        if side == "Left":
+            left_seen = True
+            state.update_position(landmarks[WRIST].x, landmarks[WRIST].y, width, height)
+            state.grab = is_fist(landmarks)
+            labels[side] = "fist (grab)" if state.grab else "open"
+        elif side == "Right":
+            gesture = thumb_gesture(landmarks)
+            state.update_height(gesture, dt)
+            labels[side] = f"thumb {gesture}"
+    if not left_seen:
+        state.grab = False
+    return labels
+
+
+def draw_overlay(image, result, labels: dict[str, str], state: ArmState, connected: bool) -> None:
+    h, w = image.shape[:2]
+    for landmarks, handedness in zip(result.hand_landmarks, result.handedness):
+        pts = [(int(p.x * w), int(p.y * h)) for p in landmarks]
+        for a, b in HAND_CONNECTIONS:
+            cv2.line(image, pts[a], pts[b], (0, 200, 0), 2)
+        for p in pts:
+            cv2.circle(image, p, 3, (0, 0, 255), -1)
+        side = user_side(handedness[0].category_name)
+        cv2.putText(image, f"{side}: {labels.get(side, '')}", (pts[WRIST][0] - 40, pts[WRIST][1] + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+    status = "sketch connected" if connected else "waiting for sketch"
+    hud = f"x={state.x:6.1f}  y={state.y:6.1f}  z={state.z:6.1f}  grab={state.grab}  |  {status}"
+    cv2.putText(image, hud, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--camera", type=int, default=0, help="webcam index (default 0)")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=65432)
+    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="path to hand_landmarker.task")
+    args = parser.parse_args()
+
+    landmarker = create_landmarker(ensure_model(args.model))
+    server = LineServer(args.host, args.port)
+    state = ArmState()
+
+    webcam = cv2.VideoCapture(args.camera)
+    if not webcam.isOpened():
+        raise SystemExit(f"Could not open camera {args.camera}")
+
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    start = last = time.monotonic()
+    last_ts = -1
+    try:
+        while True:
+            ok, frame = webcam.read()
+            if not ok:
+                print("Could not read a frame from the camera")
                 break
 
-            image = cv2.flip(image, 1)
+            # Mirror the image so the preview and the arm's X axis behave like
+            # a mirror (see user_side() for what this does to hand labels).
+            frame = cv2.flip(frame, 1)
+            h, w = frame.shape[:2]
 
-            # Convertir la imagen de BGR a RGB
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            now = time.monotonic()
+            dt, last = now - last, now
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            # VIDEO mode needs strictly increasing timestamps
+            last_ts = max(int((now - start) * 1000), last_ts + 1)
+            result = landmarker.detect_for_video(mp_image, last_ts)
 
-            # Detectar las manos en la imagen
-            results = hands.process(image_rgb)
+            labels = apply_result(result, state, w, h, dt)
+            server.send(state.message())
 
-            # Dibujar los landmarks de las manos
-            if results.multi_hand_landmarks:
-                for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
-                    # Determina si es la mano izquierda o derecha
-                    hand_label = results.multi_handedness[idx].classification[0].label
-                    
-                    if hand_label == "Right":
-                        mp_drawing.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-                        
-                        # Añade el texto de la clasificación en la imagen
-                        coords = tuple(np.multiply(
-                            [hand_landmarks.landmark[mp_hands.HandLandmark.WRIST].x,
-                             hand_landmarks.landmark[mp_hands.HandLandmark.WRIST].y],
-                            [image.shape[1], image.shape[0]]).astype(int))
-                        cv2.putText(image, hand_label, coords, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                        
-                        # Detectar gesto del pulgar
-                        gesture = detect_thumb_gesture(hand_landmarks)
-                        cv2.putText(image, gesture, (coords[0], coords[1] - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-
-                        if gesture == "Thumb Up":
-                            z -= 1.0
-                        elif gesture == "Thumb Down":
-                            z += 1.0
-                        
-                    elif hand_label == "Left":
-                        mp_drawing.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-                        
-                        # Obtener las coordenadas de la muñeca (wrist)
-                        wrist_x = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST].x
-                        wrist_y = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST].y
-
-                        # Ajustar las coordenadas al tamaño de la imagen
-                        image_height, image_width, _ = image.shape
-                        wrist_x = wrist_x * image_width
-                        wrist_y = wrist_y * image_height
-
-                        # Dividir la imagen en cuatro cuadrantes
-                        half_width = image_width / 2
-                        half_height = image_height / 2
-
-                        if wrist_x < half_width:
-                            wrist_x = wrist_x - half_width
-                        else:
-                            wrist_x = wrist_x - half_width
-
-                        if wrist_y < half_height:
-                            wrist_y = half_height - wrist_y
-                        else:
-                            wrist_y = half_height - wrist_y
-
-                        is_closed = is_hand_closed(hand_landmarks)
-
-                        # Enviar las coordenadas de la muñeca al servidor
-                        Message = f'{(wrist_x / 2.5) * -1},{(wrist_y / 2.5) * -1},{z},{is_closed}'
-                        print(f'Coordenadas de la muñeca: ({wrist_x}, {wrist_y}, {z}, {is_closed})')
-                        conn.sendall(Message.encode())
-
-            # Mostrar la imagen con los landmarks de las manos
-            cv2.imshow('Detección de Manos', image)
-
-            # Salir del bucle si se presiona 'q'
-            if cv2.waitKey(5) & 0xFF == ord('q'):
+            draw_overlay(frame, result, labels, state, server.connected)
+            cv2.imshow(WINDOW, frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+    finally:
+        webcam.release()
+        cv2.destroyAllWindows()
+        server.close()
+        landmarker.close()
 
-    # Liberar la cámara y cerrar las ventanas
-    webcam.release()
-    cv2.destroyAllWindows()
-
-def main():
-    # Crear un socket TCP/IP
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as servidor:
-        servidor.bind((HOST, PORT))  # Enlazar el socket al puerto
-        servidor.listen()  # Escuchar las conexiones entrantes
-        print(f"Servidor TCP iniciado. Esperando conexiones en {HOST}:{PORT}")  # Mostrar mensaje de inicio
-
-        conn, addr = servidor.accept()  # Aceptar la conexión entrante
-        with conn:
-            print(f"Conexión establecida desde {addr}")
-            # Inicializar la cámara
-            webcam = cv2.VideoCapture(0)
-            detect_hands(webcam, conn)
 
 if __name__ == "__main__":
     main()
