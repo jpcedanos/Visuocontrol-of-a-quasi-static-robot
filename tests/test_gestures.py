@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from gestures import ArmState, Workspace, choose_hand, hand_size, palm_center, pinch_ratio
+from gestures import ArmState, OneEuroFilter, Workspace, choose_hand, hand_size, palm_center, pinch_ratio
 from synthetic import hand
 
 # --- hand measurements --------------------------------------------------------
@@ -27,7 +27,7 @@ def test_palm_center_does_not_move_when_pinching():
 
 
 def fresh(**kw):
-    return ArmState(smoothing=0.0, depth_smoothing=0.0, **kw)
+    return ArmState(filtering=False, **kw)
 
 
 def test_palm_position_maps_to_side_and_height():
@@ -109,11 +109,62 @@ def test_losing_the_hand_releases_but_keeps_position():
     assert (s.x, s.y, s.z) == before
 
 
-def test_smoothing_moves_part_of_the_way():
-    s = ArmState(smoothing=0.5)
+def _noisy_still(n=300, fps=30, noise=2.0, seed=1):
+    import random
+    rnd = random.Random(seed)
+    return [(i / fps, 50 + rnd.gauss(0, noise)) for i in range(n)]
+
+
+def _std(values):
+    m = sum(values) / len(values)
+    return (sum((v - m) ** 2 for v in values) / len(values)) ** 0.5
+
+
+def test_one_euro_removes_most_jitter_when_still():
+    f = OneEuroFilter(min_cutoff=1.0, beta=0.02)
+    samples = _noisy_still()
+    out = [f(v, t) for t, v in samples][60:]  # skip warm-up
+    assert _std(out) < 0.4 * _std([v for _, v in samples][60:])
+
+
+def test_one_euro_keeps_up_with_fast_motion():
+    # hand sweeping across the workspace at 200 units/s, 30 fps
+    f = OneEuroFilter(min_cutoff=1.0, beta=0.02)
+    out = [(f(200 * t, t), 200 * t) for t in (i / 30 for i in range(30))]
+    lag = out[-1][1] - out[-1][0]
+    assert 0 <= lag < 8  # a plain low-pass at 1 Hz would trail by ~30 units here
+
+
+def test_one_euro_beats_a_plain_average_at_both():
+    """Steadier than the old 50% moving average when still, with no more lag when moving."""
+    def ema(samples, k=0.5):
+        y, out = None, []
+        for _, v in samples:
+            y = v if y is None else k * y + (1 - k) * v
+            out.append(y)
+        return out
+    still = _noisy_still()
+    f = OneEuroFilter(min_cutoff=1.0, beta=0.02)
+    assert _std([f(v, t) for t, v in still][60:]) < _std(ema(still)[60:])
+    ramp = [(i / 30, 200 * i / 30) for i in range(30)]
+    f = OneEuroFilter(min_cutoff=1.0, beta=0.02)
+    euro_lag = ramp[-1][1] - [f(v, t) for t, v in ramp][-1]
+    ema_lag = ramp[-1][1] - ema(ramp)[-1]
+    assert euro_lag <= ema_lag * 1.1
+
+
+def test_arm_state_filters_with_frame_times():
+    s = ArmState()
+    for i, (t, v) in enumerate(_noisy_still(noise=0.01)):
+        s.update(0.5 + (v - 50) / 100, 0.5, 100, 1.0, t=t)
+    assert abs(s.y) < 1.0
+
+
+def test_depth_uses_separate_gains_for_near_and_far():
+    s = fresh(workspace=Workspace(depth_gain_near=200, depth_gain_far=50))
     s.update(0.5, 0.5, 100, 1.0)
-    s.update(0.85, 0.5, 100, 1.0)  # target side = 85
-    assert s.y == pytest.approx(42.5)
+    assert s.depth_for(100 * math.exp(0.1)) == pytest.approx(-20)  # closer: deeper (negative)
+    assert s.depth_for(100 * math.exp(-0.1)) == pytest.approx(5)    # farther: nearer
 
 
 def test_default_workspace_stays_within_arm_reach():
@@ -127,7 +178,7 @@ def test_default_workspace_stays_within_arm_reach():
 
 def test_message_is_one_line_in_the_sketch_format():
     s = ArmState(x=1.234, y=-5.0, z=7.5, grab=True)
-    assert s.message() == "1.23,-5.00,7.50,True\n"
+    assert s.message() == "1.23,-5.00,7.50,True,run\n"
 
 
 # --- choosing a hand ----------------------------------------------------------

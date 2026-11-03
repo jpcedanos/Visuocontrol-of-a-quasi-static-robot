@@ -5,15 +5,21 @@
   The distance where your hand first appears is the middle; press c to re-center.
 - Pinch thumb and index together to grab the cube; open them to drop it.
 
+On the first run (or with --calibrate, or k in the sketch) a short routine
+measures how your hand's size changes with distance; see calibration.py.
+v in the sketch starts/stops recording the session to recordings/ (replay.py).
+
 The script runs two TCP servers the Processing sketch connects to (it can be
 started or restarted at any time):
-- port 65432: one ``x,y,z,grab\\n`` line per frame; the sketch can send back
-  ``recenter\\n`` when c is pressed in its window.
+- port 65432: one ``x,y,z,grab,mode\\n`` line per frame (mode is run, calib or
+  rec); the sketch sends back ``recenter``, ``calibrate`` or ``record`` lines
+  when c, k or v is pressed in its window.
 - port 65433: the camera preview as JPEG frames, each prefixed with its
   4-byte big-endian length, so the sketch can show it in the same window.
 
 Usage:
-    python hand_detector.py [--camera 0] [--invert-depth] [--no-window] [--host 127.0.0.1] [--port 65432]
+    python hand_detector.py [--camera 0] [--invert-depth] [--no-window] [--calibrate] [--record]
+                            [--host 127.0.0.1] [--port 65432]
 """
 
 from __future__ import annotations
@@ -32,8 +38,11 @@ import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
 
+from calibration import DEFAULT_FILE as CALIBRATION_FILE
+from calibration import Calibrator, DepthCalibration
 from gestures import (HAND_CONNECTIONS, INDEX_TIP, THUMB_TIP, ArmState, Workspace, choose_hand, hand_size,
                       palm_center, pinch_ratio)
+from recording import Recorder, new_path
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -188,28 +197,61 @@ def to_pixels(landmarks, width: int, height: int) -> list[Pixel]:
 
 
 class OneHandControl:
-    """Turns HandLandmarker results into arm targets, following one hand."""
+    """Turns HandLandmarker results into arm targets, following one hand.
 
-    def __init__(self, state: ArmState):
+    While a calibration is running, the arm holds still and the hand's size
+    feeds the calibration routine instead.
+    """
+
+    def __init__(self, state: ArmState, calibration: DepthCalibration | None = None):
         self.state = state
         self.palm: tuple[float, float] | None = None  # last palm position, in pixels
         self.active: int | None = None                # index of the hand in control
         self.pinch: float | None = None
+        self.calibrator: Calibrator | None = None
+        self.just_calibrated: DepthCalibration | None = None  # set for one frame when a calibration ends
+        if calibration:
+            self.apply_calibration(calibration)
 
-    def apply(self, result, width: int, height: int) -> None:
+    @property
+    def calibrating(self) -> bool:
+        return self.calibrator is not None
+
+    def start_calibration(self) -> None:
+        self.calibrator = Calibrator(depth_limit=max(map(abs, self.state.workspace.depth)))
+        self.state.hand_lost()  # let go of the cube
+
+    def apply_calibration(self, cal: DepthCalibration) -> None:
+        self.state.workspace.depth_gain_near = cal.gain_near
+        self.state.workspace.depth_gain_far = cal.gain_far
+
+    def apply(self, result, width: int, height: int, t: float | None = None) -> None:
+        self.just_calibrated = None
         hands = [to_pixels(lms, width, height) for lms in result.hand_landmarks]
         self.active = choose_hand(hands, self.palm)
-        if self.active is None:
+        hand = hands[self.active] if self.active is not None else None
+        if hand is None:
             self.state.hand_lost()
             self.palm = self.pinch = None
-            return
-        hand = hands[self.active]
-        self.palm = palm_center(hand)
-        self.pinch = pinch_ratio(hand)
-        self.state.update(self.palm[0] / width, self.palm[1] / height, hand_size(hand), self.pinch)
+        else:
+            self.palm = palm_center(hand)
+            self.pinch = pinch_ratio(hand)
+
+        if self.calibrator is not None:
+            self.calibrator.update(hand_size(hand) if hand else None, time.monotonic() if t is None else t)
+            if self.calibrator.done:
+                self.apply_calibration(self.calibrator.result)
+                self.state.ref_size = self.calibrator.center_size  # the comfortable distance is the middle
+                self.just_calibrated = self.calibrator.result
+                self.calibrator = None
+            return  # the arm holds still while calibrating
+
+        if hand is not None:
+            self.state.update(self.palm[0] / width, self.palm[1] / height, hand_size(hand), self.pinch, t)
 
 
-def draw_overlay(image, result, control: OneHandControl, connected: bool, hints: bool = True) -> None:
+def draw_overlay(image, result, control: OneHandControl, connected: bool, hints: bool = True,
+                 recording: Recorder | None = None) -> None:
     h, w = image.shape[:2]
     state = control.state
     for i, landmarks in enumerate(result.hand_landmarks):
@@ -232,13 +274,84 @@ def draw_overlay(image, result, control: OneHandControl, connected: bool, hints:
         status = "sketch connected" if connected else "waiting for sketch"
         lines = [
             f"side {state.y:6.1f}  height {-state.z:6.1f}  depth {-state.x:6.1f}  grab={state.grab}  |  {status}",
-            "pinch to grab   c: re-center depth   q: quit" if control.active is not None else "show one hand to the camera",
+            "pinch to grab   c: re-center   k: calibrate   v: record   q: quit" if control.active is not None
+            else "show one hand to the camera",
         ]
     else:  # shown inside the sketch, which has its own status bar
         lines = [] if control.active is not None else ["show one hand to the camera"]
     for i, text in enumerate(lines):
         cv2.putText(image, text, (10, 25 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(image, text, (10, 25 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+    if control.calibrator is not None:
+        draw_calibration(image, control.calibrator)
+    if recording is not None:
+        # red dot and elapsed time, top right
+        cv2.circle(image, (w - 110, 24), 8, (0, 0, 255), -1)
+        cv2.putText(image, f"REC {int(recording.seconds) // 60:02d}:{int(recording.seconds) % 60:02d}",
+                    (w - 95, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+
+
+def draw_calibration(image, cal: Calibrator) -> None:
+    """Instruction banner with step number and a hold-progress bar."""
+    h, w = image.shape[:2]
+    top = h - 110
+    band = image[top:h].copy()
+    cv2.rectangle(band, (0, 0), (w, 110), (0, 0, 0), -1)
+    image[top:h] = cv2.addWeighted(band, 0.65, image[top:h], 0.35, 0)
+    step = min(cal.step + 1, len(cal.STEPS))
+    cv2.putText(image, f"Calibrating depth  {step}/{len(cal.STEPS)}", (16, top + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2, cv2.LINE_AA)
+    scale = 0.7  # shrink the instruction until it fits the frame
+    while scale > 0.4 and cv2.getTextSize(cal.prompt, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)[0][0] > w - 32:
+        scale -= 0.05
+    cv2.putText(image, cal.prompt, (16, top + 62), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2, cv2.LINE_AA)
+    bar_w = w - 32
+    cv2.rectangle(image, (16, top + 80), (16 + bar_w, top + 94), (90, 90, 90), 1)
+    cv2.rectangle(image, (16, top + 80), (16 + int(bar_w * cal.progress), top + 94), (0, 200, 255), -1)
+
+
+class Session:
+    """What the main loop keeps track of besides the arm: calibration file and recording."""
+
+    def __init__(self, control: OneHandControl, frame_size: tuple[int, int], calibration_file: Path):
+        self.control = control
+        self.frame_size = frame_size
+        self.calibration_file = calibration_file
+        self.recorder: Recorder | None = None
+
+    def command(self, cmd: str) -> None:
+        """Commands from the sketch window (or keys in the camera window)."""
+        if cmd == "recenter":
+            self.control.state.recenter_depth()
+        elif cmd == "calibrate":
+            self.control.start_calibration()
+            print("Calibrating depth: follow the instructions on the camera image")
+        elif cmd == "record":
+            self.toggle_recording()
+
+    def toggle_recording(self) -> None:
+        if self.recorder is None:
+            self.recorder = Recorder(new_path(), self.frame_size, self.control.state)
+            print(f"Recording to {self.recorder.path}")
+        else:
+            self.recorder.close()
+            print(f"Saved {self.recorder.frames} frames to {self.recorder.path}")
+            self.recorder = None
+
+    def after_frame(self, result, t: float) -> None:
+        control = self.control
+        if control.just_calibrated:
+            control.just_calibrated.save(self.calibration_file)
+            print(f"Calibration saved to {self.calibration_file}: "
+                  f"near gain {control.just_calibrated.gain_near:.0f}, far gain {control.just_calibrated.gain_far:.0f}")
+        if self.recorder is not None:
+            self.recorder.write(t, result.hand_landmarks, control.state)
+        control.state.mode = "calib" if control.calibrating else "rec" if self.recorder else "run"
+
+    def close(self) -> None:
+        if self.recorder is not None:
+            self.toggle_recording()
 
 
 def main() -> None:
@@ -251,6 +364,9 @@ def main() -> None:
                         help="moving the hand toward the camera brings the arm nearer instead of deeper")
     parser.add_argument("--no-window", action="store_true",
                         help="don't open the camera window; the sketch shows the camera instead (used by the launcher)")
+    parser.add_argument("--calibrate", action="store_true", help="run the depth calibration even if one is saved")
+    parser.add_argument("--calibration-file", type=Path, default=CALIBRATION_FILE)
+    parser.add_argument("--record", action="store_true", help="start recording the session right away")
     args = parser.parse_args()
 
     landmarker = create_landmarker(ensure_model(args.model))
@@ -260,10 +376,21 @@ def main() -> None:
     webcam = cv2.VideoCapture(args.camera)
     if not webcam.isOpened():
         raise SystemExit(f"Could not open camera {args.camera}")
+    frame_size = (int(webcam.get(cv2.CAP_PROP_FRAME_WIDTH)), int(webcam.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
     server = LineServer(args.host, args.port)
     video = FrameServer(args.host, args.port + 1)  # camera preview for the sketch's window
-    control = OneHandControl(ArmState(workspace=Workspace(invert_depth=args.invert_depth)))
+
+    saved = DepthCalibration.load(args.calibration_file)
+    control = OneHandControl(ArmState(workspace=Workspace(invert_depth=args.invert_depth)), saved)
+    if saved is None or args.calibrate:
+        control.start_calibration()
+        print("Calibrating depth: follow the instructions on the camera image")
+    else:
+        print(f"Using saved calibration ({args.calibration_file.name}); press k in the sketch to redo it")
+    session = Session(control, frame_size, args.calibration_file)
+    if args.record:
+        session.toggle_recording()
 
     # Tell launcher.py we are listening (it sets this variable).
     ready_file = os.environ.get("VISUOCONTROL_READY_FILE")
@@ -291,14 +418,15 @@ def main() -> None:
             last_ts = max(int((now - start) * 1000), last_ts + 1)
             result = landmarker.detect_for_video(mp_image, last_ts)
 
-            control.apply(result, w, h)
+            session.frame_size = (w, h)
+            for command in server.commands():  # keys pressed in the sketch window
+                session.command(command)
+            control.apply(result, w, h, now)
+            session.after_frame(result, now)
             server.send(control.state.message())
 
-            for command in server.commands():  # keys pressed in the sketch window
-                if command == "recenter":
-                    control.state.recenter_depth()
-
-            draw_overlay(frame, result, control, server.connected, hints=not args.no_window)
+            draw_overlay(frame, result, control, server.connected, hints=not args.no_window,
+                         recording=session.recorder)
             video.send_frame(frame)
             if args.no_window:
                 continue
@@ -306,9 +434,9 @@ def main() -> None:
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
-            if key == ord("c"):
-                control.state.recenter_depth()
+            session.command({ord("c"): "recenter", ord("k"): "calibrate", ord("v"): "record"}.get(key, ""))
     finally:
+        session.close()
         webcam.release()
         cv2.destroyAllWindows()
         server.close()

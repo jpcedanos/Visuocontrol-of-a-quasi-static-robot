@@ -1,5 +1,7 @@
 # Visuocontrol of a quasi-static robot
 
+[![CI](https://github.com/jpcedanos/Visuocontrol-of-a-quasi-static-robot/actions/workflows/ci.yml/badge.svg)](https://github.com/jpcedanos/Visuocontrol-of-a-quasi-static-robot/actions/workflows/ci.yml)
+
 Control a simulated robotic arm with one hand. A webcam tracks your hand with MediaPipe, and a Processing sketch moves a 3-DOF arm (base, shoulder, elbow) with inverse kinematics. Pinch to pick up a Rubik's cube, carry it, and let go: it falls onto a table or the floor.
 
 <!-- Add a demo here: screen-record the Visuocontrol window and save it as docs/demo.gif -->
@@ -18,10 +20,11 @@ flowchart LR
 - **Hand tracking (`hand_detector.py`):** MediaPipe's Hand Landmarker finds 21 landmarks on your hand in each frame.
 - **One-hand control (`gestures.py`):**
   - The **palm centre** (wrist and knuckles) moves the arm left/right and up/down. Fingers don't affect it, so pinching doesn't drag the arm.
-  - The **apparent size of your hand** sets depth. The size when your hand first appears is the middle; moving it toward the camera reaches deeper into the scene.
+  - The **apparent size of your hand** sets depth. Moving it toward the camera reaches deeper into the scene. How much depends on a short [calibration](#calibration) of your camera and distance.
   - A **pinch** (thumb and index tips together) grabs. It closes below 0.25 palm sizes and opens above 0.40, so it doesn't flicker at the edge.
   - With several hands in view, it keeps following the one it started with.
-- **Streaming:** the tracker runs a TCP server on `127.0.0.1:65432` and sends one newline-terminated `x,y,z,grab` line per frame.
+  - Positions go through a **One Euro filter**, the usual choice for hand tracking: it smooths heavily while your hand is still and very little while it moves. In the tests it leaves 36% of the jitter of a still hand (a plain 50% moving average leaves 57%) and lags 4.2 units at 200 units/s (the average lags 6.7).
+- **Streaming:** the tracker runs a TCP server on `127.0.0.1:65432` and sends one newline-terminated `x,y,z,grab,mode` line per frame, plus the camera preview on port 65433. The sketch sends back short commands when you press keys.
 - **Simulation (`robotic_arm.pde`):**
   - Solves the three joint angles in closed form (law of cosines and `atan2`). Out-of-reach targets leave the arm stretched toward them.
   - Picks up the cube when a pinch **starts** with the arm tip at the cube, like a real gripper. The cube then follows the tip.
@@ -67,6 +70,7 @@ The launcher:
 1. Sets up a private Python environment in `.venv` and installs MediaPipe. This takes a minute or two the **first time only**. The hand model (about 8 MB) also downloads on the first run.
 2. Finds Processing. If it can't, a window asks you to select **`Processing.exe`** (Processing 4.4 or newer) or **`processing-java.exe`** (older versions). It remembers your choice.
 3. Opens the **Visuocontrol** window: 3D views plus the camera, all in one place.
+4. On the first run, guides you through a 5-second [depth calibration](#calibration) on the camera panel.
 
 To stop, close the Visuocontrol window. The launcher stops the hand tracker too.
 
@@ -81,6 +85,9 @@ Add these after `Launch.bat` (from a terminal) or `./launch.sh`:
 | `--invert-depth` | Moving your hand toward the camera brings the arm nearer instead of deeper. |
 | `--camera-window` | Also shows the camera in its own window, like older versions. |
 | `--pick-processing` | Choose the Processing program again, e.g. after updating Processing. |
+| `--calibrate` | Runs the depth calibration again at start (same as `k` in the window). |
+| `--record` | Starts recording the session right away. |
+| `--replay FILE` | Replays a recording instead of using the camera. Add `--loop`, `--speed 2` or `--recompute` (see [Recordings](#recordings-and-replay)). |
 
 ### Troubleshooting
 
@@ -121,19 +128,45 @@ The two programs can start in any order. The sketch retries the connection every
 | Pinch thumb and index (at the cube) | Grabs the cube |
 | Open the pinch | Drops the cube |
 | `c` | Re-centers depth at your hand's current distance |
+| `k` | Runs the depth calibration again |
+| `v` | Starts / stops recording the session |
 | `r` | Puts the cube back on its table |
 | Drag the mouse on a 3D view | Rotates that view |
 | Close the window | Quits (the launcher stops the tracker too) |
 
 Tips:
-- Keep your hand at a comfortable distance when it first appears, or press `c` there: that distance becomes the middle depth.
+- If depth drifts during a session (you leaned back, say), press `c` with your hand at a comfortable distance: that becomes the middle again.
 - Line up depth in the **view from above**: the purple dot under the arm tip should sit on the cube before you pinch.
 - The status bar tells you whether you're holding the cube, or pinching away from it.
 - If depth feels backwards, start with `--invert-depth` (`Launch.bat --invert-depth`).
 
+## Calibration
+
+Cameras and seating distances differ a lot in how much bigger your hand looks when you move it closer. The first time you launch (or when you press `k`), the camera panel walks you through three steps:
+
+1. Hold your hand still at a comfortable distance. This becomes the middle depth.
+2. Move it closer to the camera and hold.
+3. Move it farther away than at the start and hold.
+
+Each step waits until your hand is steady for 0.8 s, with a progress bar. The arm holds still meanwhile. The result (`calibration.json`) sets the depth sensitivity so that your closest and farthest positions reach 90% of the workspace, and it's reused next time.
+
+## Recordings and replay
+
+Press `v` (or start with `--record`) to record a session to `recordings/session_<date>_<time>.jsonl`. A red **REC** shows on the camera panel and in the status bar. Press `v` again to save. A file stores your hand landmarks and the arm's target for every frame (under 1 MB per minute). See `recording.py` for the format.
+
+Replay it without a camera:
+
+```bash
+Launch.bat --replay recordings/session_20261103_101500.jsonl          # as recorded
+Launch.bat --replay recordings/session_20261103_101500.jsonl --loop   # over and over
+Launch.bat --replay recordings/session_20261103_101500.jsonl --recompute
+```
+
+The camera panel draws your recorded hand. `--recompute` runs the recorded hand through the **current** control code (with the calibration of the recording), which is the way to check how a change to the filter or the pinch thresholds behaves with real movements. Replays are also the easy way to capture a clean demo video.
+
 ## Tests
 
-The one-hand control rules and the launcher are covered by unit tests (with synthetic hands, so no camera is needed):
+The one-hand control rules, the filter, calibration, recording/replay and the launcher are covered by unit tests (with synthetic hands, so no camera is needed). GitHub Actions runs them on every push and also compiles the sketch:
 
 ```bash
 pip install -r requirements-dev.txt

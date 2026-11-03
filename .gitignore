@@ -6,3 +6,5 @@ venv/
 .pytest_cache/
 .build/
 launcher_config.json
+recordings/
+calibration.json

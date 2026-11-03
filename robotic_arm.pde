@@ -27,6 +27,7 @@ float alpha, beta, gamma;
 // coordX points toward the viewer, coordY to the right, coordZ down.
 float coordX, coordY, coordZ;
 boolean grabbed = false;    // the hand is pinching
+String trackerMode = "run"; // run, calib (calibrating depth), rec (recording) or replay
 boolean wasGrabbed = false;
 float tipX, tipY, tipZ;     // where the arm tip actually is, in scene coordinates
 
@@ -126,12 +127,13 @@ void keyPressed() {
     showToast("Cube reset");
   }
   if (key == 'c' || key == 'C') {
-    if (client != null && client.active()) {
-      client.write("recenter\n"); // the tracker re-centers depth at the hand's current distance
-      showToast("Depth re-centered at your hand's current distance");
-    } else {
-      showToast("Hand tracker not connected");
-    }
+    if (sendCommand("recenter")) showToast("Depth re-centered at your hand's current distance");
+  }
+  if (key == 'k' || key == 'K') {
+    if (sendCommand("calibrate")) showToast("Calibrating: follow the instructions on the camera panel");
+  }
+  if (key == 'v' || key == 'V') {
+    if (sendCommand("record")) showToast(trackerMode.equals("rec") ? "Recording saved in recordings/" : "Recording started");
   }
 }
 
@@ -225,6 +227,12 @@ void drawStatusBar() {
   if (!tracker) {
     fill(255, 110, 90);
     state = "Hand tracker not connected";
+  } else if (trackerMode.equals("replay") && !holding) {
+    fill(110, 190, 255);
+    state = "Replaying a recording";
+  } else if (trackerMode.equals("calib")) {
+    fill(255, 200, 60);
+    state = "Calibrating depth: follow the instructions on the camera panel";
   } else if (holding) {
     fill(110, 230, 120);
     state = "Holding the cube";
@@ -236,9 +244,15 @@ void drawStatusBar() {
     state = "Pinch at the cube to grab it";
   }
   text(state, r[0] + 12, y + 22);
+  if (tracker && trackerMode.equals("rec")) {
+    float x = r[0] + 24 + textWidth(state);
+    fill(255, 60, 60);
+    ellipse(x + 6, y + 17, 10, 10);
+    text("REC", x + 16, y + 22);
+  }
 
   fill(170);
-  String help = "c: re-center depth    r: reset cube    drag: rotate a view";
+  String help = "c: re-center   k: calibrate   v: record   r: reset cube   drag: rotate";
   text(help, r[0] + r[2] - textWidth(help) - 12, y + 22);
 
   if (millis() < toastUntil) {
@@ -428,13 +442,25 @@ void handleClientData() {
 }
 
 void parseCoordinates(String data) {
+  // "x,y,z,grab,mode"; older trackers send no mode
   String[] parts = split(trim(data), ',');
-  if (parts.length == 4) {
+  if (parts.length == 4 || parts.length == 5) {
     coordX = float(parts[0]);
     coordY = float(parts[1]);
     coordZ = float(parts[2]);
     grabbed = parts[3].equals("True");
+    trackerMode = parts.length == 5 ? parts[4] : "run";
   }
+}
+
+// Send a command line to the tracker (it handles calibration, depth and recording)
+boolean sendCommand(String cmd) {
+  if (client == null || !client.active()) {
+    showToast("Hand tracker not connected");
+    return false;
+  }
+  client.write(cmd + "\n");
+  return true;
 }
 
 //-------------------KINEMATICS AND LOGIC FUNCTIONS-------------------//

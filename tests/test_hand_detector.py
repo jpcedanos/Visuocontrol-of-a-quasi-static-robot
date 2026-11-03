@@ -37,7 +37,7 @@ def test_hand_leaving_the_frame_drops_the_cube():
 
 
 def test_follows_the_same_hand_when_a_second_one_appears():
-    c = OneHandControl(ArmState(smoothing=0.0))
+    c = OneHandControl(ArmState(filtering=False))
     first = hand(scale=80, at=(200, 400))
     c.apply(_result(first), W, H)
     side = c.state.y
@@ -118,3 +118,78 @@ def test_line_server_reads_commands_split_across_packets():
     server.commands()  # notices the disconnect
     assert not server.connected
     server.close()
+
+
+# --- calibration and recording in the tracker ------------------------------------
+
+from calibration import DepthCalibration  # noqa: E402
+from gestures import hand_size  # noqa: E402
+from hand_detector import Session  # noqa: E402
+from recording import read_recording  # noqa: E402
+
+
+def _run(control, scale, seconds, t0, pinch=False, fps=30):
+    t = t0
+    for i in range(int(seconds * fps)):
+        t = t0 + i / fps
+        control.apply(_result(hand(pinch=pinch, scale=scale)), W, H, t)
+    return t + 1 / fps
+
+
+def test_calibration_holds_the_arm_then_applies_gains():
+    c = OneHandControl(ArmState(filtering=False))
+    c.start_calibration()
+    t = _run(c, 100, 1.0, 0, pinch=True)
+    assert c.state.grab is False and c.state.x == 0  # arm frozen, no grabbing while calibrating
+    t = _run(c, 130, 1.0, t)
+    t = _run(c, 80, 1.0, t)
+    assert not c.calibrating
+    assert c.state.ref_size == pytest.approx(hand_size(hand(scale=100)))  # the comfortable distance is the middle
+    # closest position now reaches 90% of the depth range (deeper is negative)
+    t = _run(c, 130, 0.2, t)
+    assert c.state.x == pytest.approx(-45, abs=1.5)
+
+
+def test_saved_calibration_is_applied_without_running_the_routine():
+    c = OneHandControl(ArmState(), DepthCalibration(200, 60))
+    assert not c.calibrating
+    assert (c.state.workspace.depth_gain_near, c.state.workspace.depth_gain_far) == (200, 60)
+
+
+def test_session_saves_calibration_and_reports_mode(tmp_path):
+    c = OneHandControl(ArmState(filtering=False))
+    session = Session(c, (W, H), tmp_path / "calibration.json")
+    session.command("calibrate")
+    t = 0.0
+    for scale in (100, 130, 80):
+        for i in range(30):
+            r = _result(hand(scale=scale))
+            c.apply(r, W, H, t)
+            session.after_frame(r, t)
+            t += 1 / 30
+            if c.calibrating:
+                assert c.state.mode == "calib"
+    assert c.state.mode == "run"
+    assert DepthCalibration.load(tmp_path / "calibration.json") is not None
+
+
+def test_recording_round_trip(tmp_path, monkeypatch):
+    import recording
+    monkeypatch.setattr(recording, "DEFAULT_DIR", tmp_path)
+    monkeypatch.setattr("hand_detector.new_path", lambda: recording.new_path(tmp_path))
+    c = OneHandControl(ArmState(filtering=False), DepthCalibration(110, 110))
+    session = Session(c, (W, H), tmp_path / "cal.json")
+    session.command("record")
+    for i in range(10):
+        r = _result(hand(pinch=i >= 5, at=(200 + 10 * i, 300)))
+        c.apply(r, W, H, i / 30)
+        session.after_frame(r, i / 30)
+        assert c.state.mode == "rec"
+    path = session.recorder.path
+    session.command("record")  # stop
+    meta, frames = read_recording(path)
+    assert meta["frame"] == [W, H] and meta["version"] == 1
+    assert len(frames) == 10
+    assert frames[0]["t"] == 0 and frames[-1]["t"] == pytest.approx(9 / 30, abs=1e-3)
+    assert [f["grab"] for f in frames] == [False] * 5 + [True] * 5
+    assert len(frames[0]["hands"]) == 1 and len(frames[0]["hands"][0]) == 21

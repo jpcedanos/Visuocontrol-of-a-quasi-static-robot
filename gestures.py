@@ -16,6 +16,7 @@ Control scheme (one hand, mirrored camera view):
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 
 # MediaPipe hand landmark indices
@@ -67,6 +68,43 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+class OneEuroFilter:
+    """Low-pass filter whose cutoff rises with speed (Casiez, Roussel & Vogel, CHI 2012).
+
+    When the hand is still, the cutoff stays at ``min_cutoff`` and jitter is
+    smoothed away. When it moves fast, the cutoff rises by ``beta`` per unit of
+    speed, so the output keeps up instead of lagging behind.
+    """
+
+    def __init__(self, min_cutoff: float = 1.0, beta: float = 0.0, d_cutoff: float = 1.0):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.reset()
+
+    def reset(self) -> None:
+        self._x: float | None = None
+        self._dx = 0.0
+        self._t: float | None = None
+
+    @staticmethod
+    def _alpha(cutoff: float, dt: float) -> float:
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x: float, t: float) -> float:
+        if self._x is None or self._t is None or t <= self._t:
+            self._x, self._t = x, t
+            return x
+        dt = t - self._t
+        self._t = t
+        dx = (x - self._x) / dt
+        a_d = self._alpha(self.d_cutoff, dt)
+        self._dx = a_d * dx + (1 - a_d) * self._dx
+        cutoff = self.min_cutoff + self.beta * abs(self._dx)
+        a = self._alpha(cutoff, dt)
+        self._x = a * x + (1 - a) * self._x
+        return self._x
+
+
 @dataclass
 class Workspace:
     """How hand motion maps to the arm's target, in the sketch's arm coordinates.
@@ -80,7 +118,10 @@ class Workspace:
     height: tuple[float, float] = (-50.0, 60.0)  # coordZ at the top / bottom of the frame
     depth: tuple[float, float] = (-50.0, 50.0)   # coordX limits
     frame_margin: float = 0.15  # the outer 15% of the frame maps to the workspace edge
-    depth_gain: float = 110.0   # depth units for an e-fold change in apparent hand size
+    # Depth units per e-fold change in apparent hand size, when the hand is
+    # closer than the middle (near) or farther (far). Calibration sets these.
+    depth_gain_near: float = 110.0
+    depth_gain_far: float = 110.0
     invert_depth: bool = False  # True: moving the hand toward the camera brings the arm nearer
 
 
@@ -93,25 +134,47 @@ class ArmState:
     z: float = 0.0  # coordZ: height (negative is up)
     grab: bool = False
 
+    mode: str = "run"  # what the tracker is doing: run, calib (calibrating) or rec (recording)
+
     workspace: Workspace = field(default_factory=Workspace)
-    smoothing: float = 0.5        # 0 = none; closer to 1 = smoother but laggier
-    depth_smoothing: float = 0.7  # apparent size is noisier than position
+    # One Euro filter settings. min_cutoff (Hz): lower = steadier when still.
+    # beta: higher = less lag when moving fast. Depth (apparent size) is noisier.
+    filtering: bool = True
+    min_cutoff: float = 1.0
+    beta: float = 0.02
+    depth_min_cutoff: float = 0.5
+    depth_beta: float = 0.02
     pinch_close: float = 0.25     # pinch ratio below this starts a grab (real pinches are ~0.1)
     pinch_open: float = 0.40      # ...and above this releases it (hysteresis)
 
     ref_size: float | None = None  # hand size that means "middle depth"
-    _has_position: bool = False
+
+    def __post_init__(self):
+        self._filters = [OneEuroFilter(self.depth_min_cutoff, self.depth_beta),  # x (depth)
+                         OneEuroFilter(self.min_cutoff, self.beta),              # y (side)
+                         OneEuroFilter(self.min_cutoff, self.beta)]              # z (height)
 
     def recenter_depth(self) -> None:
         """Make the hand's next apparent size the middle depth."""
         self.ref_size = None
 
-    def update(self, palm_x: float, palm_y: float, size: float, pinch: float) -> None:
+    def depth_for(self, size: float) -> float:
+        """Arm depth (coordX) for a hand of apparent ``size``, relative to ``ref_size``."""
+        ws = self.workspace
+        r = math.log(size / self.ref_size)
+        gain = ws.depth_gain_near if r > 0 else ws.depth_gain_far
+        sign = 1 if ws.invert_depth else -1  # default: closer to the camera = deeper
+        return _clamp(sign * gain * r, *ws.depth)
+
+    def update(self, palm_x: float, palm_y: float, size: float, pinch: float, t: float | None = None) -> None:
         """Update from one frame.
 
         palm_x and palm_y are normalized (0..1) in the mirrored frame; size is
-        the hand size in pixels; pinch is ``pinch_ratio``.
+        the hand size in pixels; pinch is ``pinch_ratio``; t is the frame time
+        in seconds (defaults to now).
         """
+        if t is None:
+            t = time.monotonic()
         ws = self.workspace
         span = 1 - 2 * ws.frame_margin
         u = _clamp((palm_x - ws.frame_margin) / span, 0, 1)
@@ -121,16 +184,11 @@ class ArmState:
 
         if self.ref_size is None:
             self.ref_size = size
-        sign = 1 if ws.invert_depth else -1  # default: closer to the camera = deeper
-        x = _clamp(sign * ws.depth_gain * math.log(size / self.ref_size), *ws.depth)
+        x = self.depth_for(size)
 
-        if self._has_position:
-            k, kd = self.smoothing, self.depth_smoothing
-            y = k * self.y + (1 - k) * y
-            z = k * self.z + (1 - k) * z
-            x = kd * self.x + (1 - kd) * x
+        if self.filtering:
+            x, y, z = (f(v, t) for f, v in zip(self._filters, (x, y, z)))
         self.x, self.y, self.z = x, y, z
-        self._has_position = True
 
         if self.grab and pinch > self.pinch_open:
             self.grab = False
@@ -142,8 +200,8 @@ class ArmState:
         self.grab = False
 
     def message(self) -> str:
-        """One newline-terminated line in the wire format the sketch parses."""
-        return f"{self.x:.2f},{self.y:.2f},{self.z:.2f},{self.grab}\n"
+        """One newline-terminated line in the wire format the sketch parses: x,y,z,grab,mode."""
+        return f"{self.x:.2f},{self.y:.2f},{self.z:.2f},{self.grab},{self.mode}\n"
 
 
 def choose_hand(hands, previous: tuple[float, float] | None):

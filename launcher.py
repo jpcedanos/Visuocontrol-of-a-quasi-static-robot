@@ -15,6 +15,7 @@ Usage:
     python launcher.py --check         # verify the setup and compile the sketch, then exit
     python launcher.py --pick-processing   # choose the Processing program again
     python launcher.py --camera-window # also show the camera in its own window
+    python launcher.py --replay recordings/session_....jsonl [--loop] [--speed 2] [--recompute]
     python launcher.py --camera 1      # any other options go to hand_detector.py
 """
 
@@ -255,8 +256,12 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--pick-processing", action="store_true", help="choose the Processing program again")
     parser.add_argument("--camera-window", action="store_true",
                         help="also show the camera in its own window (by default it appears inside the sketch's window)")
+    parser.add_argument("--replay", type=Path, metavar="RECORDING",
+                        help="replay a recorded session instead of using the camera")
     args, tracker_args = parser.parse_known_args(argv)
-    if not args.camera_window:
+    if args.replay:
+        tracker_args = [str(args.replay), *tracker_args]  # e.g. --loop, --speed 2, --recompute
+    elif not args.camera_window:
         tracker_args = ["--no-window", *tracker_args]
     return args, tracker_args
 
@@ -290,7 +295,8 @@ def main() -> None:
 
     tracker = sketch = None
     try:
-        tracker = start([str(py), "hand_detector.py", *tracker_args], "hand tracker")
+        script, name = ("replay.py", "replay") if args.replay else ("hand_detector.py", "hand tracker")
+        tracker = start([str(py), script, *tracker_args], name)
         # The first run downloads the hand model, so allow some time.
         if not wait_until_ready(tracker, ready_file, timeout=120):
             fail("The hand tracker did not start. See its messages above (camera in use or not found?).")

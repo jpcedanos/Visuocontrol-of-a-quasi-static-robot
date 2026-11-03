@@ -79,3 +79,9 @@ def test_stage_sketch_copies_into_a_folder_named_after_the_pde(tmp_path, monkeyp
 def test_tracker_options_are_passed_through(argv, expected):
     _, tracker_args = launcher.parse_args(argv)
     assert tracker_args == expected
+
+
+def test_replay_runs_the_recording_instead_of_the_camera():
+    args, tracker_args = launcher.parse_args(["--replay", "recordings/s.jsonl", "--loop"])
+    assert str(args.replay).endswith("s.jsonl")
+    assert tracker_args == ["recordings/s.jsonl", "--loop"]  # no --no-window: replay has no camera window
