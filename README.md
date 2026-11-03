@@ -4,47 +4,17 @@
 
 Control a simulated robotic arm with one hand. A webcam tracks your hand with MediaPipe, and a Processing sketch moves a 4-DOF arm (base, shoulder and elbow by inverse kinematics, plus a wrist you turn by turning your hand) with a two-finger gripper. Pinch to pick up a Rubik's cube, carry it, turn it, and let go: it falls onto a table or the floor. A task mode times you moving the cube between tables and records every attempt.
 
-<!-- Add a demo here: screen-record the Visuocontrol window and save it as docs/demo.gif -->
-<!-- ![Demo](docs/demo.gif) -->
+![Moving the cube between tables with one hand: the front view, the view from above and the camera in one window](docs/demo.gif)
 
-## How it works
+## Features
 
-```mermaid
-flowchart LR
-    WEB[Webcam] --> PY[hand_detector.py<br/>OpenCV + MediaPipe Hand Landmarker<br/>TCP server :65432]
-    PY -- ":65432  x,y,z,grab,mode,roll (one line per frame)" --> PDE[robotic_arm.pde<br/>Processing 3D + IK<br/>one window, three panels]
-    PY -- ":65433  camera preview (JPEG frames)" --> PDE
-    PDE -. "recenter / calibrate / record (keys c, k, v)" .-> PY
-```
-
-- **Hand tracking (`hand_detector.py`):** MediaPipe's Hand Landmarker finds 21 landmarks on your hand in each frame.
-- **One-hand control (`gestures.py`):**
-  - The **palm centre** (wrist and knuckles) moves the arm left/right and up/down. Fingers don't affect it, so pinching doesn't drag the arm.
-  - The **apparent size of your hand** sets depth. Moving it toward the camera reaches deeper into the scene. How much depends on a short [calibration](#calibration) of your camera and distance.
-  - **Turning your hand** like a dial turns the wrist (and a held cube). It uses the wrist-to-knuckle direction, so it works with either hand and pinching doesn't change it; turns under 10° are ignored and the wrist stops at ±80°.
-  - A **pinch** (thumb and index tips together) grabs. It closes below 0.25 palm sizes and opens above 0.40, so it doesn't flicker at the edge.
-  - With several hands in view, it keeps following the one it started with.
-  - Positions go through a **One Euro filter**, the usual choice for hand tracking: it smooths heavily while your hand is still and very little while it moves. In the tests it leaves 36% of the jitter of a still hand (a plain 50% moving average leaves 57%) and lags 4.2 units at 200 units/s (the average lags 6.7).
-- **Streaming:** the tracker runs a TCP server on `127.0.0.1:65432` and sends one newline-terminated `x,y,z,grab,mode,roll` line per frame, plus the camera preview on port 65433. The sketch sends back short commands when you press keys.
-- **Simulation (`robotic_arm.pde`):**
-  - Solves the base, shoulder and elbow angles in closed form (law of cosines and `atan2`) so the tool tip reaches the target. Out-of-reach targets leave the arm stretched toward them.
-  - A two-finger **gripper** opens, closes on the cube, or closes fully when you pinch on nothing.
-  - Picks up the cube when a pinch **starts** with the tool tip at the cube, like a real gripper. The cube slides between the fingers, then moves and turns with them.
-  - When you let go, the cube falls (at the angle the gripper held it) and lands flat on a table top or the floor, with a small bounce, keeping its heading.
-  - Shadows under the cube and the arm tip show where they are above the ground, which helps to judge depth.
-  - Everything is in **one window** that opens centered and sized to your screen:
-
-    ```
-    ┌──────────────────────────────┬──────────────┐
-    │                              │  View from   │
-    │       Front view             │  above       │
-    │                              ├──────────────┤
-    │                              │  Camera and  │
-    │  status · shortcuts          │  your hand   │
-    └──────────────────────────────┴──────────────┘
-    ```
-
-    The front view is for aiming left/right and up/down, the view from above for judging depth, and the camera panel shows what the tracker sees, with the pinch highlighted. Drag the mouse on either 3D view to rotate it.
+- **One-hand control:** palm position moves the arm, the hand's apparent size sets depth, turning the hand turns the wrist, and a pinch grabs.
+- **Stable tracking:** One Euro filtering, pinch hysteresis, and a short calibration for your camera and seating distance.
+- **Simulation:** closed-form inverse kinematics, a gripper that holds the cube by its faces, and gravity when you let go.
+- **One window:** front view, a view from above for depth, and the camera with your tracked hand.
+- **Task mode with metrics:** time, pickups, drops and path efficiency for each attempt, recorded to CSV.
+- **Recording and replay** of whole sessions, including re-running recorded hands through the current control code.
+- **One-click launcher** for Windows, macOS and Linux, unit tests, and CI that also compiles the sketch.
 
 ## Quick start (one click)
 
@@ -102,25 +72,6 @@ Add these after `Launch.bat` (from a terminal) or `./launch.sh`:
 | Processing opens but the sketch errors | Run `Launch.bat --check` to see the compiler output. |
 | Wrong Processing version picked | Run `Launch.bat --pick-processing`. |
 
-## Running the parts by hand
-
-If you prefer not to use the launcher:
-
-1. Install the Python packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. Start the hand tracker:
-   ```bash
-   python hand_detector.py
-   ```
-   Options: `--camera N` to pick another webcam, `--host` / `--port` to change the address. Run by hand, it opens its own camera window (`q` quits, `c` re-centers depth); add `--no-window` to show the camera only inside the sketch.
-3. Open `robotic_arm.pde` in Processing and press Run.
-
-The two programs can start in any order. The sketch retries the connection every 2 seconds, and the tracker accepts a new connection if the sketch is restarted.
-
-`debug_client.py` prints the stream without the simulation, which is handy for checking the tracker on its own.
-
 ## Controls
 
 | Input | Effect |
@@ -144,16 +95,6 @@ Tips:
 - The status bar tells you whether you're holding the cube, or pinching away from it.
 - If depth feels backwards, start with `--invert-depth` (`Launch.bat --invert-depth`).
 
-## Calibration
-
-Cameras and seating distances differ a lot in how much bigger your hand looks when you move it closer. The first time you launch (or when you press `k`), the camera panel walks you through three steps:
-
-1. Hold your hand still at a comfortable distance, upright. Its position becomes the middle of the workspace, its size the middle depth, and its angle the straight wrist.
-2. Move it closer to the camera and hold.
-3. Move it farther away than at the start and hold.
-
-Each step waits until your hand is steady for 0.8 s, with a progress bar. The arm holds still meanwhile. The result (`calibration.json`) sets the depth sensitivity so that your closest and farthest positions reach 90% of the workspace, and it's reused next time.
-
 ## Task mode
 
 The front view shows a green square on the other table. Move the cube onto it:
@@ -165,7 +106,17 @@ The front view shows a green square on the other table. Move the cube onto it:
 Every attempt is recorded automatically in `recordings/`:
 
 - `attempts.csv`: one row per completed attempt (time, pickups, drops, path length, straight line, efficiency, which table, frames file). Open it in Excel or pandas to see how you improve.
-- `attempt_<date>_<time>.csv`: every frame of that attempt: the target sent by the tracker, the joint angles (`base`, `shoulder`, `elbow`, `wrist`), the gripper opening, the tool tip, and the cube's position and heading. These are the same observations and actions a robot-learning dataset uses, so they carry over to a MuJoCo version.
+- `attempt_<date>_<time>.csv`: every frame of that attempt: the target sent by the tracker, the joint angles (`base`, `shoulder`, `elbow`, `wrist`), the gripper opening, the tool tip, and the cube's position and heading. These are the same observations and actions a robot-learning dataset uses.
+
+## Calibration
+
+Cameras and seating distances differ a lot in how much bigger your hand looks when you move it closer. The first time you launch (or when you press `k`), the camera panel walks you through three steps:
+
+1. Hold your hand still at a comfortable distance, upright. Its position becomes the middle of the workspace, its size the middle depth, and its angle the straight wrist.
+2. Move it closer to the camera and hold.
+3. Move it farther away than at the start and hold.
+
+Each step waits until your hand is steady for 0.8 s, with a progress bar. The arm holds still meanwhile. The result (`calibration.json`) sets the depth sensitivity so that your closest and farthest positions reach 90% of the workspace, and it's reused next time.
 
 ## Recordings and replay
 
@@ -181,6 +132,64 @@ Launch.bat --replay recordings/session_20261103_101500.jsonl --recompute
 
 The camera panel draws your recorded hand. `--recompute` runs the recorded hand through the **current** control code (with the calibration of the recording), which is the way to check how a change to the filter or the pinch thresholds behaves with real movements. Replays are also the easy way to capture a clean demo video.
 
+## How it works
+
+```mermaid
+flowchart LR
+    WEB[Webcam] --> PY[hand_detector.py<br/>OpenCV + MediaPipe Hand Landmarker<br/>TCP server :65432]
+    PY -- ":65432  x,y,z,grab,mode,roll (one line per frame)" --> PDE[robotic_arm.pde<br/>Processing 3D + IK<br/>one window, three panels]
+    PY -- ":65433  camera preview (JPEG frames)" --> PDE
+    PDE -. "recenter / calibrate / record (keys c, k, v)" .-> PY
+```
+
+- **Hand tracking (`hand_detector.py`):** MediaPipe's Hand Landmarker finds 21 landmarks on your hand in each frame.
+- **One-hand control (`gestures.py`):**
+  - The **palm centre** (wrist and knuckles) moves the arm left/right and up/down. Fingers don't affect it, so pinching doesn't drag the arm.
+  - The **apparent size of your hand** sets depth. Moving it toward the camera reaches deeper into the scene. How much depends on a short [calibration](#calibration) of your camera and distance.
+  - **Turning your hand** like a dial turns the wrist (and a held cube). It uses the wrist-to-knuckle direction, so it works with either hand and pinching doesn't change it; turns under 10° are ignored and the wrist stops at ±80°.
+  - A **pinch** (thumb and index tips together) grabs. It closes below 0.25 palm sizes and opens above 0.40, so it doesn't flicker at the edge.
+  - With several hands in view, it keeps following the one it started with.
+  - Positions go through a **One Euro filter**, the usual choice for hand tracking: it smooths heavily while your hand is still and very little while it moves. In the tests it leaves 36% of the jitter of a still hand (a plain 50% moving average leaves 57%) and lags 4.2 units at 200 units/s (the average lags 6.7).
+- **Streaming:** the tracker runs a TCP server on `127.0.0.1:65432` and sends one newline-terminated `x,y,z,grab,mode,roll` line per frame, plus the camera preview on port 65433. The sketch sends back short commands when you press keys.
+- **Simulation (`robotic_arm.pde`):**
+  - Solves the base, shoulder and elbow angles in closed form (law of cosines and `atan2`) so the tool tip reaches the target. Out-of-reach targets leave the arm stretched toward them.
+  - A two-finger **gripper** opens, closes on the cube, or closes fully when you pinch on nothing.
+  - Picks up the cube when a pinch **starts** with the tool tip at the cube, like a real gripper. The cube slides between the fingers, then moves and turns with them.
+  - When you let go, the cube falls (at the angle the gripper held it) and lands flat on a table top or the floor, with a small bounce, keeping its heading.
+  - Shadows under the cube and the arm tip show where they are above the ground, which helps to judge depth.
+  - Everything is in **one window** that opens centered and sized to your screen:
+
+    ```
+    ┌──────────────────────────────┬──────────────┐
+    │                              │  View from   │
+    │       Front view             │  above       │
+    │                              ├──────────────┤
+    │                              │  Camera and  │
+    │  status · shortcuts          │  your hand   │
+    └──────────────────────────────┴──────────────┘
+    ```
+
+    The front view is for aiming left/right and up/down, the view from above for judging depth, and the camera panel shows what the tracker sees, with the pinch highlighted. Drag the mouse on either 3D view to rotate it.
+
+## Running the parts by hand
+
+If you prefer not to use the launcher:
+
+1. Install the Python packages:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Start the hand tracker:
+   ```bash
+   python hand_detector.py
+   ```
+   Options: `--camera N` to pick another webcam, `--host` / `--port` to change the address. Run by hand, it opens its own camera window (`q` quits, `c` re-centers depth); add `--no-window` to show the camera only inside the sketch.
+3. Open `robotic_arm.pde` in Processing and press Run.
+
+The two programs can start in any order. The sketch retries the connection every 2 seconds, and the tracker accepts a new connection if the sketch is restarted.
+
+`debug_client.py` prints the stream without the simulation, which is handy for checking the tracker on its own.
+
 ## Tests
 
 The one-hand control rules, the filter, calibration, recording/replay and the launcher are covered by unit tests (with synthetic hands, so no camera is needed). GitHub Actions runs them on every push and also compiles the sketch:
@@ -190,6 +199,11 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
+## History
+
+- **v1.0, 2024: the original version**, built without AI assistance while I studied at Tecnológico de Monterrey. It controlled the arm with two hands (the left wrist moved it and a fist grabbed; the right thumb raised and lowered it), with MediaPipe in Python and the 3D simulation in Processing. It is kept as-is on the [`original-two-hands`](https://github.com/jpcedanos/Visuocontrol-of-a-quasi-static-robot/tree/original-two-hands) branch and the [v1.0-original](https://github.com/jpcedanos/Visuocontrol-of-a-quasi-static-robot/releases/tag/v1.0-original) release.
+- **v2.0, 2026: a rework with the help of an AI assistant (Claude):** migration to the current MediaPipe API, fixes to the network protocol and the kinematics, one-hand control with a gripper and wrist, gravity, the single-window layout, task mode, recording, the launcher, tests and CI. The commit history shows each step.
+
 ## Built with
 
-OpenCV · MediaPipe Tasks · Processing (OpenGL)
+Python · OpenCV · MediaPipe Tasks · Processing (OpenGL)
