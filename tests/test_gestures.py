@@ -178,7 +178,7 @@ def test_default_workspace_stays_within_arm_reach():
 
 def test_message_is_one_line_in_the_sketch_format():
     s = ArmState(x=1.234, y=-5.0, z=7.5, grab=True)
-    assert s.message() == "1.23,-5.00,7.50,True,run\n"
+    assert s.message() == "1.23,-5.00,7.50,True,run,0.000\n"
 
 
 # --- choosing a hand ----------------------------------------------------------
@@ -194,3 +194,67 @@ def test_choose_biggest_hand_first_then_follow_it():
 
 def test_no_hands():
     assert choose_hand([], None) is None
+
+
+# --- wrist rotation ---------------------------------------------------------------
+
+from gestures import hand_roll  # noqa: E402
+
+
+@pytest.mark.parametrize("deg", [0, 25, -40, 90, -90])
+def test_hand_roll_measures_the_turn_of_the_hand(deg):
+    assert math.degrees(hand_roll(hand(angle=math.radians(deg)))) == pytest.approx(deg, abs=1e-6)
+
+
+def test_hand_roll_ignores_pinching_and_size():
+    a = hand_roll(hand(angle=0.5))
+    assert hand_roll(hand(angle=0.5, pinch=True)) == pytest.approx(a)
+    assert hand_roll(hand(angle=0.5, scale=40)) == pytest.approx(a)
+
+
+def test_small_turns_are_ignored_and_big_ones_are_limited():
+    s = fresh()
+    assert s.roll_for(math.radians(8)) == 0  # inside the 10 degree dead zone
+    assert math.degrees(s.roll_for(math.radians(40))) == pytest.approx(30)  # 40 minus the dead zone
+    assert math.degrees(s.roll_for(math.radians(-150))) == pytest.approx(-80)  # limited
+
+
+def test_roll_is_relative_to_the_calibrated_rest_angle():
+    s = fresh()
+    s.roll_ref = math.radians(20)  # this person rests their hand slightly turned
+    assert s.roll_for(math.radians(20)) == 0
+    assert math.degrees(s.roll_for(math.radians(60))) == pytest.approx(30)
+
+
+def test_update_sets_roll_and_message_carries_it():
+    s = fresh()
+    s.update(0.5, 0.5, 100, 1.0, t=0.0, hand_angle=math.radians(55))
+    assert math.degrees(s.roll) == pytest.approx(45)
+    assert s.message().endswith(f",{s.roll:.3f}\n")
+
+
+def test_no_angle_keeps_the_wrist_where_it_is():
+    s = fresh()
+    s.update(0.5, 0.5, 100, 1.0, t=0.0, hand_angle=math.radians(55))
+    s.update(0.5, 0.5, 100, 1.0, t=0.1)
+    assert math.degrees(s.roll) == pytest.approx(45)
+
+
+# --- calibrated centre ------------------------------------------------------------
+
+
+def test_calibrated_rest_position_maps_to_the_middle_of_the_workspace():
+    s = fresh(workspace=Workspace(center_x=0.35, center_y=0.6))
+    s.update(0.35, 0.6, 100, 1.0, t=0.0)
+    middle_height = sum(Workspace().height) / 2
+    assert (s.y, s.z) == pytest.approx((0, middle_height))
+
+
+def test_default_centre_keeps_the_original_mapping():
+    a, b = fresh(), fresh(workspace=Workspace(center_x=0.5, center_y=0.5))
+    for px, py in [(0.15, 0.15), (0.3, 0.7), (0.85, 0.85)]:
+        a.update(px, py, 100, 1.0, t=0.0)
+        b.update(px, py, 100, 1.0, t=0.0)
+        assert (a.y, a.z) == pytest.approx((b.y, b.z))
+    a.update(0.15, 0.15, 100, 1.0, t=0.0)
+    assert (a.y, a.z) == pytest.approx((-85, -50))

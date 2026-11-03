@@ -1,9 +1,11 @@
-"""Depth calibration: learn how much your hand's apparent size changes with distance.
+"""Calibration: where your hand rests, and how much its apparent size changes with distance.
 
 Cameras, lenses and how far you sit all change how much bigger your hand looks
 when you move it toward the camera. A short guided routine measures that:
 
-1. Hold your hand still at a comfortable distance (this becomes the middle).
+1. Hold your hand still at a comfortable distance (this becomes the middle:
+   its position is the centre of the workspace, its size the middle depth and
+   its tilt the straight wrist).
 2. Move it closer to the camera and hold.
 3. Move it farther away and hold.
 
@@ -27,6 +29,11 @@ DEFAULT_FILE = Path(__file__).parent / "calibration.json"
 class DepthCalibration:
     gain_near: float
     gain_far: float
+    # Rest position of the palm (normalized, mirrored frame) and its roll.
+    # Files saved before these existed load with the defaults (frame centre, upright).
+    center_x: float = 0.5
+    center_y: float = 0.5
+    roll_ref: float = 0.0
 
     def save(self, path: Path = DEFAULT_FILE) -> None:
         path.write_text(json.dumps(asdict(self), indent=2))
@@ -35,7 +42,9 @@ class DepthCalibration:
     def load(cls, path: Path = DEFAULT_FILE) -> "DepthCalibration | None":
         try:
             data = json.loads(path.read_text())
-            return cls(float(data["gain_near"]), float(data["gain_far"]))
+            return cls(float(data["gain_near"]), float(data["gain_far"]),
+                       float(data.get("center_x", 0.5)), float(data.get("center_y", 0.5)),
+                       float(data.get("roll_ref", 0.0)))
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
@@ -61,6 +70,8 @@ class Calibrator:
         self.sizes: dict[str, float] = {}
         self.result: DepthCalibration | None = None
         self._window: deque[tuple[float, float]] = deque()
+        self._poses: list[tuple[float, float, float]] = []  # palm x, y and roll during the centre hold
+        self.center = (0.5, 0.5, 0.0)
         self.progress = 0.0               # 0..1 of the current hold, for the on-screen bar
 
     @property
@@ -83,11 +94,15 @@ class Calibrator:
             return size >= ref * self.min_change
         return size <= ref / self.min_change
 
-    def update(self, size: float | None, t: float) -> None:
+    def update(self, size: float | None, t: float, palm: tuple[float, float] | None = None,
+               roll: float | None = None) -> None:
+        """Feed one frame: hand size in pixels (None if no hand), time, and for the
+        centre step the palm position (normalized) and hand roll."""
         if self.done:
             return
         if size is None or not self._in_position(size):
             self._window.clear()
+            self._poses.clear()
             self.progress = 0.0
             return
         # The window holds every sample since this hold started; the hold
@@ -98,12 +113,18 @@ class Calibrator:
             # moving too much: start the hold again from this frame
             self._window.clear()
             self._window.append((t, size))
+            self._poses.clear()
             self.progress = 0.0
             return
+        if self.current == "center" and palm is not None:
+            self._poses.append((palm[0], palm[1], 0.0 if roll is None else roll))
         held = t - self._window[0][0]
         self.progress = min(1.0, held / self.hold_time)
         if held >= self.hold_time:
             self.sizes[self.current] = sorted(sizes)[len(sizes) // 2]  # median
+            if self.current == "center" and self._poses:
+                self.center = tuple(sorted(p[i] for p in self._poses)[len(self._poses) // 2] for i in range(3))
+            self._poses.clear()
             self._window.clear()
             self.progress = 0.0
             self.step += 1
@@ -116,7 +137,7 @@ class Calibrator:
         lo, hi = self.gain_range
         gain_near = min(hi, max(lo, target / math.log(near / ref)))
         gain_far = min(hi, max(lo, target / math.log(ref / far)))
-        return DepthCalibration(gain_near, gain_far)
+        return DepthCalibration(gain_near, gain_far, *self.center)
 
     @property
     def center_size(self) -> float | None:

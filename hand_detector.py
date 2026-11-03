@@ -4,6 +4,7 @@
 - Move your hand toward the camera: the arm reaches deeper into the scene.
   The distance where your hand first appears is the middle; press c to re-center.
 - Pinch thumb and index together to grab the cube; open them to drop it.
+- Turn your hand (like a dial) to rotate the wrist and the cube it holds.
 
 On the first run (or with --calibrate, or k in the sketch) a short routine
 measures how your hand's size changes with distance; see calibration.py.
@@ -11,7 +12,7 @@ v in the sketch starts/stops recording the session to recordings/ (replay.py).
 
 The script runs two TCP servers the Processing sketch connects to (it can be
 started or restarted at any time):
-- port 65432: one ``x,y,z,grab,mode\\n`` line per frame (mode is run, calib or
+- port 65432: one ``x,y,z,grab,mode,roll\\n`` line per frame (mode is run, calib or
   rec); the sketch sends back ``recenter``, ``calibrate`` or ``record`` lines
   when c, k or v is pressed in its window.
 - port 65433: the camera preview as JPEG frames, each prefixed with its
@@ -40,8 +41,8 @@ from mediapipe.tasks.python import vision
 
 from calibration import DEFAULT_FILE as CALIBRATION_FILE
 from calibration import Calibrator, DepthCalibration
-from gestures import (HAND_CONNECTIONS, INDEX_TIP, THUMB_TIP, ArmState, Workspace, choose_hand, hand_size,
-                      palm_center, pinch_ratio)
+from gestures import (HAND_CONNECTIONS, INDEX_TIP, THUMB_TIP, ArmState, Workspace, choose_hand, hand_roll,
+                      hand_size, palm_center, pinch_ratio)
 from recording import Recorder, new_path
 
 MODEL_URL = (
@@ -222,8 +223,10 @@ class OneHandControl:
         self.state.hand_lost()  # let go of the cube
 
     def apply_calibration(self, cal: DepthCalibration) -> None:
-        self.state.workspace.depth_gain_near = cal.gain_near
-        self.state.workspace.depth_gain_far = cal.gain_far
+        ws = self.state.workspace
+        ws.depth_gain_near, ws.depth_gain_far = cal.gain_near, cal.gain_far
+        ws.center_x, ws.center_y = cal.center_x, cal.center_y
+        self.state.roll_ref = cal.roll_ref
 
     def apply(self, result, width: int, height: int, t: float | None = None) -> None:
         self.just_calibrated = None
@@ -238,7 +241,9 @@ class OneHandControl:
             self.pinch = pinch_ratio(hand)
 
         if self.calibrator is not None:
-            self.calibrator.update(hand_size(hand) if hand else None, time.monotonic() if t is None else t)
+            self.calibrator.update(hand_size(hand) if hand else None, time.monotonic() if t is None else t,
+                                   palm=(self.palm[0] / width, self.palm[1] / height) if hand else None,
+                                   roll=hand_roll(hand) if hand else None)
             if self.calibrator.done:
                 self.apply_calibration(self.calibrator.result)
                 self.state.ref_size = self.calibrator.center_size  # the comfortable distance is the middle
@@ -247,7 +252,8 @@ class OneHandControl:
             return  # the arm holds still while calibrating
 
         if hand is not None:
-            self.state.update(self.palm[0] / width, self.palm[1] / height, hand_size(hand), self.pinch, t)
+            self.state.update(self.palm[0] / width, self.palm[1] / height, hand_size(hand), self.pinch, t,
+                              hand_angle=hand_roll(hand))
 
 
 def draw_overlay(image, result, control: OneHandControl, connected: bool, hints: bool = True,

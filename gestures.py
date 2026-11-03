@@ -55,6 +55,23 @@ def hand_size(lms) -> float:
     return (_dist(lms[WRIST], lms[MIDDLE_MCP]) + _dist(lms[INDEX_MCP], lms[PINKY_MCP])) / 2 or 1e-6
 
 
+def hand_roll(lms) -> float:
+    """How far the hand is turned in the camera's plane, in radians.
+
+    0 with the fingers pointing up; positive when the hand turns clockwise on
+    screen (fingers toward the right). Uses the wrist and the middle knuckle,
+    so it is the same for either hand and pinching does not change it.
+    """
+    dx = lms[MIDDLE_MCP].x - lms[WRIST].x
+    dy = lms[MIDDLE_MCP].y - lms[WRIST].y
+    return math.atan2(dx, -dy)
+
+
+def wrap_angle(a: float) -> float:
+    """Wrap an angle to [-pi, pi)."""
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
 def pinch_ratio(lms) -> float:
     """Thumb-tip to index-tip distance, in palm sizes. Small means pinching."""
     return _dist(lms[THUMB_TIP], lms[INDEX_TIP]) / hand_size(lms)
@@ -118,11 +135,18 @@ class Workspace:
     height: tuple[float, float] = (-50.0, 60.0)  # coordZ at the top / bottom of the frame
     depth: tuple[float, float] = (-50.0, 50.0)   # coordX limits
     frame_margin: float = 0.15  # the outer 15% of the frame maps to the workspace edge
+    # Palm position (normalized, mirrored frame) that maps to the middle of the
+    # workspace. Calibration sets it to where your hand rests comfortably.
+    center_x: float = 0.5
+    center_y: float = 0.5
     # Depth units per e-fold change in apparent hand size, when the hand is
     # closer than the middle (near) or farther (far). Calibration sets these.
     depth_gain_near: float = 110.0
     depth_gain_far: float = 110.0
     invert_depth: bool = False  # True: moving the hand toward the camera brings the arm nearer
+    # Wrist rotation follows the hand's roll beyond a small dead zone, up to a limit
+    roll_deadzone: float = math.radians(10)
+    roll_limit: float = math.radians(80)
 
 
 @dataclass
@@ -133,6 +157,7 @@ class ArmState:
     y: float = 0.0  # coordY: sideways
     z: float = 0.0  # coordZ: height (negative is up)
     grab: bool = False
+    roll: float = 0.0  # wrist rotation in radians (positive: clockwise as seen on screen)
 
     mode: str = "run"  # what the tracker is doing: run, calib (calibrating) or rec (recording)
 
@@ -148,11 +173,13 @@ class ArmState:
     pinch_open: float = 0.40      # ...and above this releases it (hysteresis)
 
     ref_size: float | None = None  # hand size that means "middle depth"
+    roll_ref: float = 0.0          # hand roll that means "wrist straight" (calibration sets it)
 
     def __post_init__(self):
         self._filters = [OneEuroFilter(self.depth_min_cutoff, self.depth_beta),  # x (depth)
                          OneEuroFilter(self.min_cutoff, self.beta),              # y (side)
-                         OneEuroFilter(self.min_cutoff, self.beta)]              # z (height)
+                         OneEuroFilter(self.min_cutoff, self.beta),              # z (height)
+                         OneEuroFilter(self.min_cutoff, self.beta)]              # roll
 
     def recenter_depth(self) -> None:
         """Make the hand's next apparent size the middle depth."""
@@ -166,19 +193,29 @@ class ArmState:
         sign = 1 if ws.invert_depth else -1  # default: closer to the camera = deeper
         return _clamp(sign * gain * r, *ws.depth)
 
-    def update(self, palm_x: float, palm_y: float, size: float, pinch: float, t: float | None = None) -> None:
+    def roll_for(self, hand_angle: float) -> float:
+        """Wrist rotation for a hand turned by ``hand_angle`` (see hand_roll)."""
+        ws = self.workspace
+        r = wrap_angle(hand_angle - self.roll_ref)
+        r = math.copysign(max(0.0, abs(r) - ws.roll_deadzone), r)  # small turns do nothing
+        return _clamp(r, -ws.roll_limit, ws.roll_limit)
+
+    def update(self, palm_x: float, palm_y: float, size: float, pinch: float, t: float | None = None,
+               hand_angle: float | None = None) -> None:
         """Update from one frame.
 
         palm_x and palm_y are normalized (0..1) in the mirrored frame; size is
         the hand size in pixels; pinch is ``pinch_ratio``; t is the frame time
-        in seconds (defaults to now).
+        in seconds (defaults to now); hand_angle is ``hand_roll`` (None keeps
+        the wrist where it is).
         """
         if t is None:
             t = time.monotonic()
         ws = self.workspace
         span = 1 - 2 * ws.frame_margin
-        u = _clamp((palm_x - ws.frame_margin) / span, 0, 1)
-        v = _clamp((palm_y - ws.frame_margin) / span, 0, 1)
+        # The calibrated rest position maps to the middle of the workspace
+        u = _clamp((palm_x - ws.center_x) / span + 0.5, 0, 1)
+        v = _clamp((palm_y - ws.center_y) / span + 0.5, 0, 1)
         y = _lerp(*ws.side, u)
         z = _lerp(*ws.height, v)
 
@@ -186,9 +223,11 @@ class ArmState:
             self.ref_size = size
         x = self.depth_for(size)
 
+        roll = self.roll if hand_angle is None else self.roll_for(hand_angle)
+
         if self.filtering:
-            x, y, z = (f(v, t) for f, v in zip(self._filters, (x, y, z)))
-        self.x, self.y, self.z = x, y, z
+            x, y, z, roll = (f(v, t) for f, v in zip(self._filters, (x, y, z, roll)))
+        self.x, self.y, self.z, self.roll = x, y, z, roll
 
         if self.grab and pinch > self.pinch_open:
             self.grab = False
@@ -200,8 +239,8 @@ class ArmState:
         self.grab = False
 
     def message(self) -> str:
-        """One newline-terminated line in the wire format the sketch parses: x,y,z,grab,mode."""
-        return f"{self.x:.2f},{self.y:.2f},{self.z:.2f},{self.grab},{self.mode}\n"
+        """One newline-terminated line in the wire format the sketch parses: x,y,z,grab,mode,roll."""
+        return f"{self.x:.2f},{self.y:.2f},{self.z:.2f},{self.grab},{self.mode},{self.roll:.3f}\n"
 
 
 def choose_hand(hands, previous: tuple[float, float] | None):

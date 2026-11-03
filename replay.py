@@ -84,6 +84,7 @@ class Player:
         if not self.recompute:
             state.x, state.y, state.z = frame["target"]
             state.grab = frame["grab"]
+            state.roll = frame.get("roll", 0.0)  # recordings made before wrist rotation have none
         state.mode = "replay"
         return frame, result
 

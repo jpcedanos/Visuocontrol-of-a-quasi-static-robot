@@ -193,3 +193,21 @@ def test_recording_round_trip(tmp_path, monkeypatch):
     assert frames[0]["t"] == 0 and frames[-1]["t"] == pytest.approx(9 / 30, abs=1e-3)
     assert [f["grab"] for f in frames] == [False] * 5 + [True] * 5
     assert len(frames[0]["hands"]) == 1 and len(frames[0]["hands"][0]) == 21
+
+
+def test_calibration_sets_centre_and_rest_tilt_then_turning_rotates_the_wrist():
+    import math
+    from calibration import DepthCalibration
+    c = OneHandControl(ArmState(filtering=False), DepthCalibration(110, 110, center_x=0.3, center_y=0.5,
+                                                                    roll_ref=math.radians(15)))
+    # a hand resting where it was calibrated: arm in the middle, wrist straight
+    rest = hand(scale=100, at=(0.3 * W, 0.5 * H), angle=math.radians(15))
+    from gestures import palm_center
+    cx, cy = palm_center(rest)
+    rest = hand(scale=100, at=(0.3 * W - (cx - 0.3 * W), 0.5 * H - (cy - 0.5 * H)), angle=math.radians(15))
+    c.apply(_result(rest), W, H, t=0.0)
+    assert c.state.y == pytest.approx(0, abs=1e-6)
+    assert c.state.roll == 0
+    turned = hand(scale=100, at=(0.3 * W, 0.5 * H), angle=math.radians(65))
+    c.apply(_result(turned), W, H, t=0.1)
+    assert math.degrees(c.state.roll) == pytest.approx(40, abs=0.5)

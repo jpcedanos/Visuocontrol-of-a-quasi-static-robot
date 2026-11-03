@@ -4,6 +4,7 @@ Coordinates are in arbitrary units with the same scale on both axes (like
 pixels). ``hand()`` builds an open hand or a pinch, then scales and moves it.
 """
 
+import math
 from types import SimpleNamespace
 
 
@@ -22,11 +23,12 @@ _OPEN = {
 }
 
 
-def hand(pinch: bool = False, scale: float = 100.0, at=(320.0, 240.0)):
+def hand(pinch: bool = False, scale: float = 100.0, at=(320.0, 240.0), angle: float = 0.0):
     """An open hand, or one pinching thumb and index together.
 
     ``scale`` is the palm height in pixels (bigger = closer to the camera) and
-    ``at`` is where the wrist is.
+    ``at`` is where the wrist is. ``angle`` (radians) turns the hand around
+    the wrist, clockwise on screen.
     """
     pts = dict(_OPEN)
     if pinch:
@@ -34,4 +36,5 @@ def hand(pinch: bool = False, scale: float = 100.0, at=(320.0, 240.0)):
         pts[6], pts[7], pts[8] = (-0.40, -1.30), (-0.55, -1.15), (-0.62, -1.00)
         pts[3], pts[4] = (-0.60, -0.75), (-0.64, -0.98)
     ox, oy = at
-    return [_p(ox + x * scale, oy + y * scale) for _, (x, y) in sorted(pts.items())]
+    c, s = math.cos(angle), math.sin(angle)
+    return [_p(ox + (x * c - y * s) * scale, oy + (x * s + y * c) * scale) for _, (x, y) in sorted(pts.items())]

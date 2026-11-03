@@ -76,3 +76,28 @@ def test_save_and_load(tmp_path):
     assert DepthCalibration.load(tmp_path / "missing.json") is None
     (tmp_path / "bad.json").write_text("{not json")
     assert DepthCalibration.load(tmp_path / "bad.json") is None
+
+
+def test_centre_step_records_rest_position_and_tilt(tmp_path):
+    cal = Calibrator(depth_limit=50)
+    t = 0.0
+    for i in range(30):  # hold still at (0.4, 0.55), hand turned 0.2 rad
+        t = i / 30
+        cal.update(100, t, palm=(0.4, 0.55), roll=0.2)
+    assert cal.current == "near"
+    t = feed(cal, 130, 1.0, t + 0.1)
+    feed(cal, 80, 1.0, t)
+    r = cal.result
+    assert (r.center_x, r.center_y, r.roll_ref) == pytest.approx((0.4, 0.55, 0.2))
+
+    path = tmp_path / "calibration.json"
+    r.save(path)
+    assert DepthCalibration.load(path) == r
+
+
+def test_files_saved_before_the_centre_existed_still_load(tmp_path):
+    path = tmp_path / "calibration.json"
+    path.write_text('{"gain_near": 120.0, "gain_far": 90.0}')
+    cal = DepthCalibration.load(path)
+    assert (cal.gain_near, cal.gain_far) == (120.0, 90.0)
+    assert (cal.center_x, cal.center_y, cal.roll_ref) == (0.5, 0.5, 0.0)

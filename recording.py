@@ -5,7 +5,7 @@ The first line is a header; every other line is one camera frame:
     {"type": "meta", "version": 1, "frame": [640, 480], "started": "...",
      "workspace": {...}, "settings": {...}}
     {"type": "frame", "t": 0.033, "hands": [[[x, y], ... 21 points], ...],
-     "target": [x, y, z], "grab": false}
+     "target": [x, y, z], "grab": false, "roll": 0.0}
 
 Hand points are normalized (0..1) in the mirrored camera frame, exactly as
 MediaPipe returned them, so a recording can be replayed as-is or run again
@@ -58,6 +58,7 @@ class Recorder:
             "hands": [[[round(p.x, 5), round(p.y, 5)] for p in lms] for lms in hands],
             "target": [round(state.x, 3), round(state.y, 3), round(state.z, 3)],
             "grab": state.grab,
+            "roll": round(state.roll, 4),
         })
         self.frames += 1
 

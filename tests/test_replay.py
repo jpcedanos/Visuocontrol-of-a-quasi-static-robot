@@ -76,3 +76,18 @@ def test_render_draws_the_hand(recorded):
     image = render(frame, result, p.control, p.size, "REPLAY")
     assert image.shape == (H, W, 3)
     assert image.max() > 100  # landmarks and label drawn on the dark background
+
+
+def test_recordings_without_roll_replay_with_a_straight_wrist(tmp_path):
+    import json
+    from recording import read_recording
+    from replay import Player
+    path = tmp_path / "old.jsonl"
+    hand_pts = [[0.5, 0.5]] * 21
+    path.write_text(json.dumps({"type": "meta", "version": 1, "frame": [640, 480]}) + "\n"
+                    + json.dumps({"type": "frame", "t": 0.0, "hands": [hand_pts], "target": [1, 2, 3],
+                                  "grab": False}) + "\n")
+    player = Player(*read_recording(path))
+    player.step()
+    assert player.control.state.roll == 0.0
+    assert player.control.state.message().endswith(",replay,0.000\n")

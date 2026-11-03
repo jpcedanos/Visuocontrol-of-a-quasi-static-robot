@@ -30,6 +30,16 @@ boolean grabbed = false;    // the hand is pinching
 String trackerMode = "run"; // run, calib (calibrating depth), rec (recording) or replay
 boolean wasGrabbed = false;
 float tipX, tipY, tipZ;     // where the arm tip actually is, in scene coordinates
+float wristRoll = 0;        // wrist rotation from the tracker, radians (turn your hand like a dial)
+
+// Arm geometry measured from the models: the shoulder joint sits 11 units below
+// the scene origin (-40 + 4 + 25), and along the last link the gripper fingers
+// run from 13.5 to 21.5 with the tool tip (the IK target) at 20.
+final float SHOULDER_Y = -11;
+final float GRASP = 15;               // centre between the fingers, along the last link
+final float GRIP_OPEN = 18, GRIP_CLOSED = 3;
+float gripGap = GRIP_OPEN;            // current finger opening, animated
+float graspX, graspY, graspZ;         // centre between the fingers, scene coordinates
 
 // Scene geometry in scene coordinates (+Y is up), measured from table.obj and cube.obj
 final float TABLE_TOP = -36.9;
@@ -42,7 +52,11 @@ final float CUBE_START_X = -60, CUBE_START_Y = -37, CUBE_START_Z = 0;
 float posX = CUBE_START_X, posY = CUBE_START_Y, posZ = CUBE_START_Z;
 float velY = 0;
 boolean holding = false;
-float holdDX, holdDY, holdDZ; // cube offset from the tip while it is held
+float cubeYaw = 0;           // cube rotation about the vertical axis while it rests
+PMatrix3D cubeTilt = null;    // cube orientation while it falls after release (null: upright)
+float pickX, pickY, pickZ;    // where the cube was when picked up
+float holdTime = 0;           // seconds since it was picked up (it slides into the fingers)
+final float SNAP_TIME = 0.15;
 
 final float GRAB_RADIUS = 14; // tip must be this close to the cube's centre to pick it up
 final float GRAVITY = 1500;   // scene units per second squared
@@ -158,6 +172,8 @@ void resetCube() {
   posY = CUBE_START_Y;
   posZ = CUBE_START_Z;
   velY = 0;
+  cubeYaw = 0;
+  cubeTilt = null;
   holding = false;
 }
 
@@ -333,10 +349,39 @@ void drawTables(PGraphics p) {
 
 void drawCube(PGraphics p) {
   p.pushMatrix();
-  p.translate(posX, posY, posZ);
+  if (holding) {
+    // Held: the cube is part of the gripper, centred between the fingers
+    // (which press on its two faces along the link's X axis).
+    p.translate(posX, posY + CUBE_HEIGHT / 2, posZ);
+    p.applyMatrix(heldOrientation());
+    p.translate(0, -CUBE_HEIGHT / 2, 0);
+  } else if (cubeTilt != null) {
+    // Falling after release, still at the angle the gripper held it
+    p.translate(posX, posY + CUBE_HEIGHT / 2, posZ);
+    p.applyMatrix(cubeTilt);
+    p.translate(0, -CUBE_HEIGHT / 2, 0);
+  } else {
+    p.translate(posX, posY, posZ);
+    p.rotateY(cubeYaw);
+  }
   p.scale(0.75);
   p.shape(cube);
   p.popMatrix();
+}
+
+// Orientation of a cube held by the gripper: the last link's rotation
+PMatrix3D heldOrientation() {
+  PMatrix3D m = lastLinkFrame();
+  m.m03 = m.m13 = m.m23 = 0; // rotation only
+  return m;
+}
+
+// Rotation about the vertical axis that best matches an orientation, used
+// when a released cube lands flat
+float yawOf(PMatrix3D r) {
+  PVector x = r.mult(new PVector(1, 0, 0), null);
+  if (abs(x.y) > 0.9) x = r.mult(new PVector(0, 0, 1), null); // X nearly vertical: use Z instead
+  return atan2(-x.z, x.x);
 }
 
 void drawRoboticArm(PGraphics p) {
@@ -360,7 +405,24 @@ void drawRoboticArm(PGraphics p) {
 
   p.translate(0, 0, -50);
   p.rotateY(PI);
+  p.rotateZ(wristRoll); // the wrist turns the last link and the gripper about its axis
   if (end != null) p.shape(end);
+  drawGripper(p);
+}
+
+// Two fingers on a small plate, in the last link's frame (its axis is +Z)
+void drawGripper(PGraphics p) {
+  p.fill(85);
+  p.pushMatrix();
+  p.translate(0, 0, 13.5);
+  p.box(GRIP_OPEN + 6, 5, 1.5);
+  p.popMatrix();
+  for (int side = -1; side <= 1; side += 2) {
+    p.pushMatrix();
+    p.translate(side * (gripGap / 2 + 1), 0, 17.5);
+    p.box(2, 5, 8);
+    p.popMatrix();
+  }
 }
 
 //-------------------CLIENT COMMUNICATION FUNCTIONS-------------------//
@@ -442,14 +504,16 @@ void handleClientData() {
 }
 
 void parseCoordinates(String data) {
-  // "x,y,z,grab,mode"; older trackers send no mode
+  // "x,y,z,grab,mode,roll"; older trackers send no mode and no roll
   String[] parts = split(trim(data), ',');
-  if (parts.length == 4 || parts.length == 5) {
+  if (parts.length >= 4 && parts.length <= 6) {
     coordX = float(parts[0]);
     coordY = float(parts[1]);
     coordZ = float(parts[2]);
     grabbed = parts[3].equals("True");
-    trackerMode = parts.length == 5 ? parts[4] : "run";
+    trackerMode = parts.length >= 5 ? parts[4] : "run";
+    wristRoll = parts.length == 6 ? float(parts[5]) : 0;
+    if (Float.isNaN(wristRoll)) wristRoll = 0;
   }
 }
 
@@ -466,9 +530,11 @@ boolean sendCommand(String cmd) {
 //-------------------KINEMATICS AND LOGIC FUNCTIONS-------------------//
 
 void IK() {
+  // The target is where the tool tip should be. The IK works from the shoulder
+  // joint, which sits SHOULDER_Y below the scene origin.
   float X = coordX;
   float Y = coordY;
-  float Z = coordZ;
+  float Z = coordZ + SHOULDER_Y;
 
   float L = sqrt(Y * Y + X * X);
   float target = sqrt(Z * Z + L * L);
@@ -486,8 +552,30 @@ void IK() {
   // is out of reach, the tip stops short along the same direction.
   float k = target > 0 ? dia / target : 0;
   tipX = -Y * k;
-  tipY = -Z * k;
+  tipY = -Z * k + SHOULDER_Y;
   tipZ = -X * k;
+
+  PVector g = lastLinkFrame().mult(new PVector(0, 0, GRASP), null);
+  graspX = g.x;
+  graspY = g.y;
+  graspZ = g.z;
+}
+
+// The last link's frame in scene coordinates: the same chain drawRoboticArm draws
+PMatrix3D lastLinkFrame() {
+  PMatrix3D m = new PMatrix3D();
+  m.translate(0, -40 + 4, 0);
+  m.rotateY(gamma);
+  m.translate(0, 25, 0);
+  m.rotateY(PI);
+  m.rotateX(alpha);
+  m.translate(0, 0, 50);
+  m.rotateY(PI);
+  m.rotateX(beta);
+  m.translate(0, 0, -50);
+  m.rotateY(PI);
+  m.rotateZ(wristRoll);
+  return m;
 }
 
 // Height the cube rests on at (x, z): a table top or the floor
@@ -508,21 +596,33 @@ void updateCube(float dt) {
 
   if (!holding && pinchStarted && tipNearCube()) {
     holding = true;
-    holdDX = posX - tipX;
-    holdDY = posY - tipY;
-    holdDZ = posZ - tipZ;
+    cubeTilt = null;
+    pickX = posX;
+    pickY = posY;
+    pickZ = posZ;
+    holdTime = 0;
     velY = 0;
   } else if (holding && !grabbed) {
     holding = false; // let go: gravity takes over below
+    cubeTilt = heldOrientation();
+    cubeYaw = yawOf(cubeTilt);
     velY = 0;
   }
+
+  // Fingers: open, closed on the cube, or closed on nothing
+  float gapTarget = holding ? CUBE_HALF * 2 + 0.4 : grabbed ? GRIP_CLOSED : GRIP_OPEN;
+  gripGap += (gapTarget - gripGap) * min(1, dt * 14);
 
   float ground = supportHeight(posX, posZ);
 
   if (holding) {
-    posX = tipX + holdDX;
-    posY = tipY + holdDY;
-    posZ = tipZ + holdDZ;
+    // The cube slides between the fingers, then moves and turns with them
+    holdTime += dt;
+    float u = min(1, holdTime / SNAP_TIME);
+    u = u * u * (3 - 2 * u); // ease in and out
+    posX = lerp(pickX, graspX, u);
+    posY = lerp(pickY, graspY - CUBE_HEIGHT / 2, u);
+    posZ = lerp(pickZ, graspZ, u);
     posY = max(posY, ground); // the cube can't be pushed through a table or the floor
     return;
   }
@@ -532,6 +632,7 @@ void updateCube(float dt) {
     posY += velY * dt;
     if (posY <= ground) {
       posY = ground;
+      cubeTilt = null; // lands flat on its base, keeping its heading
       velY = -velY * BOUNCE;
       if (abs(velY) < 40) velY = 0; // settle instead of bouncing forever
     }
