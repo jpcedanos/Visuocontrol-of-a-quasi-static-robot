@@ -1,6 +1,6 @@
 # Visuocontrol of a quasi-static robot
 
-Control a simulated 6-DOF robotic arm with your hands. A webcam tracks both hands with MediaPipe, and a Processing sketch moves the arm in 3D with inverse kinematics. Close your fist to grab a cube.
+Control a simulated robotic arm with one hand. A webcam tracks your hand with MediaPipe, and a Processing sketch moves a 3-DOF arm (base, shoulder, elbow) with inverse kinematics. Pinch to pick up a Rubik's cube, carry it, and let go: it falls onto a table or the floor.
 
 <!-- Add a demo here: screen-record both windows and save it as docs/demo.gif -->
 <!-- ![Demo](docs/demo.gif) -->
@@ -13,12 +13,19 @@ flowchart LR
     PY -- "x,y,z,grab\n (one line per frame)" --> PDE[robotic_arm.pde<br/>Processing 3D + IK<br/>TCP client]
 ```
 
-- **Hand tracking (`hand_detector.py`):** MediaPipe's Hand Landmarker finds 21 landmarks per hand in each frame.
-  - **Left hand:** wrist position sets the arm's target X and Y. Closing the fist grabs the cube.
-  - **Right hand:** thumbs-up raises the arm, thumbs-down lowers it, at a constant speed while the gesture is held.
-- **Gesture rules (`gestures.py`):** a hand counts as a fist when every fingertip is closer to the wrist than its middle joint, so it works whatever way the hand is turned. A thumb gesture needs the other four fingers curled, so an open hand never moves the arm.
+- **Hand tracking (`hand_detector.py`):** MediaPipe's Hand Landmarker finds 21 landmarks on your hand in each frame.
+- **One-hand control (`gestures.py`):**
+  - The **palm centre** (wrist and knuckles) moves the arm left/right and up/down. Fingers don't affect it, so pinching doesn't drag the arm.
+  - The **apparent size of your hand** sets depth. The size when your hand first appears is the middle; moving it toward the camera reaches deeper into the scene.
+  - A **pinch** (thumb and index tips together) grabs. It closes below 0.25 palm sizes and opens above 0.40, so it doesn't flicker at the edge.
+  - With several hands in view, it keeps following the one it started with.
 - **Streaming:** the tracker runs a TCP server on `127.0.0.1:65432` and sends one newline-terminated `x,y,z,grab` line per frame.
-- **Simulation (`robotic_arm.pde`):** Processing connects as a client, solves the joint angles in closed form (law of cosines and `atan2`), and renders the arm, two tables, and a cube from OBJ models. If the hand is closed while the arm touches the cube, the cube follows the arm. Targets out of reach leave the arm fully stretched toward them.
+- **Simulation (`robotic_arm.pde`):**
+  - Solves the three joint angles in closed form (law of cosines and `atan2`). Out-of-reach targets leave the arm stretched toward them.
+  - Picks up the cube when a pinch **starts** with the arm tip at the cube, like a real gripper. The cube then follows the tip.
+  - When you let go, the cube falls under gravity and lands on a table top or the floor, with a small bounce.
+  - Shadows under the cube and the arm tip show where they are above the ground, which helps to judge depth.
+  - A second window shows the scene from above at an angle. Drag the mouse in either window to rotate its view.
 
 ## Quick start (one click)
 
@@ -57,6 +64,7 @@ Add these after `Launch.bat` (from a terminal) or `./launch.sh`:
 |---|---|
 | `--check` | Checks the setup and compiles the sketch without opening anything. Good first step if something fails. |
 | `--camera 1` | Uses another webcam (0 is the default). |
+| `--invert-depth` | Moving your hand toward the camera brings the arm nearer instead of deeper. |
 | `--pick-processing` | Choose the Processing program again, e.g. after updating Processing. |
 
 ### Troubleshooting
@@ -93,15 +101,23 @@ The two programs can start in any order. The sketch retries the connection every
 
 | Input | Effect |
 |---|---|
-| Move your left wrist | Moves the arm in X and Y |
-| Close your left fist | Grabs the cube when the arm is touching it |
-| Right hand thumbs-up / thumbs-down | Raises / lowers the arm (Z) |
-| Drag the mouse | Rotates the camera in the Processing window |
-| `q` in the camera window | Quits the tracker |
+| Move your palm left/right, up/down | Moves the arm left/right, up/down |
+| Move your hand toward / away from the camera | Arm reaches deeper / comes nearer |
+| Pinch thumb and index (at the cube) | Grabs the cube |
+| Open the pinch | Drops the cube |
+| `c` in the camera window | Re-centers depth at your hand's current distance |
+| `q` in the camera window | Quits |
+| `r` in the 3D window | Puts the cube back on its table |
+| Drag the mouse in a 3D window | Rotates that window's view |
+
+Tips:
+- Keep your hand at a comfortable distance when it first appears, or press `c` there: that distance becomes the middle depth.
+- Watch the purple dot under the arm tip to line it up with the cube before pinching.
+- If depth feels backwards, start with `--invert-depth` (`Launch.bat --invert-depth`).
 
 ## Tests
 
-The gesture rules, the arm-state logic and the launcher are covered by unit tests (with synthetic hands, so no camera is needed):
+The one-hand control rules and the launcher are covered by unit tests (with synthetic hands, so no camera is needed):
 
 ```bash
 pip install -r requirements-dev.txt
