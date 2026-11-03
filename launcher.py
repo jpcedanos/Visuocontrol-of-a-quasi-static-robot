@@ -6,13 +6,15 @@ What it does, in order:
 2. Finds Processing. It supports both the old ``processing-java`` command
    (Processing <= 4.3) and the newer ``Processing cli`` (Processing >= 4.4).
    If it can't find it, it asks you to pick the program once and remembers it.
-3. Starts hand_detector.py, waits for it to listen, then starts the sketch.
-4. When you close either one, it closes the other.
+3. Starts hand_detector.py (without its own window: the camera appears
+   inside the sketch's window), waits for it to listen, then starts the sketch.
+4. When you close the sketch's window, it stops the tracker too.
 
 Usage:
     python launcher.py                 # run everything
     python launcher.py --check         # verify the setup and compile the sketch, then exit
     python launcher.py --pick-processing   # choose the Processing program again
+    python launcher.py --camera-window # also show the camera in its own window
     python launcher.py --camera 1      # any other options go to hand_detector.py
 """
 
@@ -244,11 +246,23 @@ def port_in_use() -> bool:
 # --- main ------------------------------------------------------------------
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the hand tracker and the Processing sketch together.")
+def parse_args(argv: list[str] | None = None):
+    """Launcher options, plus the leftover options that go to hand_detector.py."""
+    # allow_abbrev=False: "--camera 1" (for the tracker) must not be read as "--camera-window"
+    parser = argparse.ArgumentParser(description="Run the hand tracker and the Processing sketch together.",
+                                     allow_abbrev=False)
     parser.add_argument("--check", action="store_true", help="verify the setup and compile the sketch, then exit")
     parser.add_argument("--pick-processing", action="store_true", help="choose the Processing program again")
-    args, tracker_args = parser.parse_known_args()
+    parser.add_argument("--camera-window", action="store_true",
+                        help="also show the camera in its own window (by default it appears inside the sketch's window)")
+    args, tracker_args = parser.parse_known_args(argv)
+    if not args.camera_window:
+        tracker_args = ["--no-window", *tracker_args]
+    return args, tracker_args
+
+
+def main() -> None:
+    args, tracker_args = parse_args()
 
     os.chdir(ROOT)
     py = ensure_venv()
@@ -282,7 +296,7 @@ def main() -> None:
             fail("The hand tracker did not start. See its messages above (camera in use or not found?).")
 
         sketch = start(sketch_command(processing, "--run"), "Processing sketch")
-        say("Running. Close the 3D window, press q in the camera window, or Ctrl+C here to stop both.")
+        say("Running. Close the Visuocontrol window (or press Ctrl+C here) to stop.")
 
         sketch_started = time.monotonic()
         while tracker.poll() is None and sketch.poll() is None:
@@ -296,7 +310,7 @@ def main() -> None:
             # Some Processing versions hand the sketch to a separate Java
             # process and return at once. Don't take that as "closed".
             say("Processing returned right away; the sketch may still be open.")
-            say("Leaving the tracker running: press q in the camera window to stop.")
+            say("Leaving the tracker running: press Ctrl+C here to stop it.")
             tracker.wait()
         else:
             say("Processing sketch closed; stopping the tracker.")

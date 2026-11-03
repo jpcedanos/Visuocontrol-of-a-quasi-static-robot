@@ -5,19 +5,24 @@
   The distance where your hand first appears is the middle; press c to re-center.
 - Pinch thumb and index together to grab the cube; open them to drop it.
 
-The script runs a TCP server and sends one line per frame:
-``x,y,z,grab\\n``. The Processing sketch connects as a client, and can be
-started or restarted at any time.
+The script runs two TCP servers the Processing sketch connects to (it can be
+started or restarted at any time):
+- port 65432: one ``x,y,z,grab\\n`` line per frame; the sketch can send back
+  ``recenter\\n`` when c is pressed in its window.
+- port 65433: the camera preview as JPEG frames, each prefixed with its
+  4-byte big-endian length, so the sketch can show it in the same window.
 
 Usage:
-    python hand_detector.py [--camera 0] [--invert-depth] [--host 127.0.0.1] [--port 65432]
+    python hand_detector.py [--camera 0] [--invert-depth] [--no-window] [--host 127.0.0.1] [--port 65432]
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import select
 import socket
+import struct
 import time
 import urllib.request
 from pathlib import Path
@@ -59,39 +64,43 @@ def create_landmarker(model_path: Path, running_mode=vision.RunningMode.VIDEO) -
     return vision.HandLandmarker.create_from_options(options)
 
 
-class LineServer:
+class StreamServer:
     """TCP server that accepts one client at a time without blocking the camera loop."""
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, name: str):
+        self.name = name
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, port))
         self.sock.listen(1)
         self.sock.setblocking(False)
         self.client: socket.socket | None = None
-        print(f"Waiting for the Processing sketch on {host}:{port}")
 
     def _accept(self) -> None:
         try:
             conn, addr = self.sock.accept()
         except BlockingIOError:
             return
-        conn.setblocking(True)
+        conn.settimeout(0.5)  # a stalled client is dropped instead of freezing the camera loop
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.client = conn
-        print(f"Sketch connected from {addr[0]}:{addr[1]}")
+        print(f"Sketch connected ({self.name}) from {addr[0]}:{addr[1]}")
 
-    def send(self, line: str) -> None:
+    def send_bytes(self, data: bytes) -> None:
         if self.client is None:
             self._accept()
         if self.client is None:
             return
         try:
-            self.client.sendall(line.encode())
+            self.client.sendall(data)
         except OSError:
-            print("Sketch disconnected; waiting for it to reconnect")
+            self._drop()
+
+    def _drop(self) -> None:
+        print(f"Sketch disconnected ({self.name}); waiting for it to reconnect")
+        if self.client:
             self.client.close()
-            self.client = None
+        self.client = None
 
     @property
     def connected(self) -> bool:
@@ -101,6 +110,68 @@ class LineServer:
         if self.client:
             self.client.close()
         self.sock.close()
+
+
+class LineServer(StreamServer):
+    """Sends one text line per frame, and reads command lines sent back by the sketch."""
+
+    def __init__(self, host: str, port: int):
+        super().__init__(host, port, "control")
+        self._inbox = b""
+        print(f"Waiting for the Processing sketch on {host}:{port}")
+
+    def send(self, line: str) -> None:
+        self.send_bytes(line.encode())
+
+    def commands(self) -> list[str]:
+        """Command lines received since the last call (e.g. "recenter")."""
+        if self.client is None:
+            return []
+        try:
+            readable, _, _ = select.select([self.client], [], [], 0)
+            if not readable:
+                return []
+            data = self.client.recv(4096)
+        except OSError:
+            self._drop()
+            return []
+        if not data:  # the sketch closed the connection
+            self._drop()
+            return []
+        self._inbox += data
+        *lines, self._inbox = self._inbox.split(b"\n")
+        return [ln.decode(errors="ignore").strip() for ln in lines if ln.strip()]
+
+
+class FrameServer(StreamServer):
+    """Streams the camera preview to the sketch as JPEG frames.
+
+    Each frame is a 4-byte big-endian length followed by the JPEG bytes.
+    """
+
+    def __init__(self, host: str, port: int, width: int = 480, quality: int = 70):
+        super().__init__(host, port, "video")
+        self.width = width
+        self.quality = quality
+
+    def send_frame(self, image) -> None:
+        if self.client is None:
+            self._accept()
+            if self.client is None:
+                return
+        self.send_bytes(encode_frame(image, self.width, self.quality))
+
+
+def encode_frame(image, width: int = 480, quality: int = 70) -> bytes:
+    """Resize to ``width`` pixels wide, JPEG-encode, and prefix with the length."""
+    h, w = image.shape[:2]
+    if w != width:
+        image = cv2.resize(image, (width, round(h * width / w)), interpolation=cv2.INTER_AREA)
+    ok, jpg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        return b""
+    data = jpg.tobytes()
+    return struct.pack(">I", len(data)) + data
 
 
 class Pixel:
@@ -138,7 +209,7 @@ class OneHandControl:
         self.state.update(self.palm[0] / width, self.palm[1] / height, hand_size(hand), self.pinch)
 
 
-def draw_overlay(image, result, control: OneHandControl, connected: bool) -> None:
+def draw_overlay(image, result, control: OneHandControl, connected: bool, hints: bool = True) -> None:
     h, w = image.shape[:2]
     state = control.state
     for i, landmarks in enumerate(result.hand_landmarks):
@@ -157,11 +228,14 @@ def draw_overlay(image, result, control: OneHandControl, connected: bool) -> Non
             cv2.putText(image, label, (pts[INDEX_TIP][0] + 10, pts[INDEX_TIP][1]),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, pinch_color, 2, cv2.LINE_AA)
 
-    status = "sketch connected" if connected else "waiting for sketch"
-    lines = [
-        f"side {state.y:6.1f}  height {-state.z:6.1f}  depth {-state.x:6.1f}  grab={state.grab}  |  {status}",
-        "pinch to grab   c: re-center depth   q: quit" if control.active is not None else "show one hand to the camera",
-    ]
+    if hints:
+        status = "sketch connected" if connected else "waiting for sketch"
+        lines = [
+            f"side {state.y:6.1f}  height {-state.z:6.1f}  depth {-state.x:6.1f}  grab={state.grab}  |  {status}",
+            "pinch to grab   c: re-center depth   q: quit" if control.active is not None else "show one hand to the camera",
+        ]
+    else:  # shown inside the sketch, which has its own status bar
+        lines = [] if control.active is not None else ["show one hand to the camera"]
     for i, text in enumerate(lines):
         cv2.putText(image, text, (10, 25 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(image, text, (10, 25 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
@@ -175,6 +249,8 @@ def main() -> None:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="path to hand_landmarker.task")
     parser.add_argument("--invert-depth", action="store_true",
                         help="moving the hand toward the camera brings the arm nearer instead of deeper")
+    parser.add_argument("--no-window", action="store_true",
+                        help="don't open the camera window; the sketch shows the camera instead (used by the launcher)")
     args = parser.parse_args()
 
     landmarker = create_landmarker(ensure_model(args.model))
@@ -186,6 +262,7 @@ def main() -> None:
         raise SystemExit(f"Could not open camera {args.camera}")
 
     server = LineServer(args.host, args.port)
+    video = FrameServer(args.host, args.port + 1)  # camera preview for the sketch's window
     control = OneHandControl(ArmState(workspace=Workspace(invert_depth=args.invert_depth)))
 
     # Tell launcher.py we are listening (it sets this variable).
@@ -193,7 +270,8 @@ def main() -> None:
     if ready_file:
         Path(ready_file).touch()
 
-    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    if not args.no_window:
+        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     start = time.monotonic()
     last_ts = -1
     try:
@@ -216,7 +294,14 @@ def main() -> None:
             control.apply(result, w, h)
             server.send(control.state.message())
 
-            draw_overlay(frame, result, control, server.connected)
+            for command in server.commands():  # keys pressed in the sketch window
+                if command == "recenter":
+                    control.state.recenter_depth()
+
+            draw_overlay(frame, result, control, server.connected, hints=not args.no_window)
+            video.send_frame(frame)
+            if args.no_window:
+                continue
             cv2.imshow(WINDOW, frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -227,6 +312,7 @@ def main() -> None:
         webcam.release()
         cv2.destroyAllWindows()
         server.close()
+        video.close()
         landmarker.close()
 
 

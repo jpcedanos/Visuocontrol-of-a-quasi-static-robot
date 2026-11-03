@@ -68,3 +68,14 @@ def test_stage_sketch_copies_into_a_folder_named_after_the_pde(tmp_path, monkeyp
     monkeypatch.setattr(launcher, "BUILD", tmp_path / ".build" / "robotic_arm")
     launcher.stage_sketch()
     assert sorted(p.name for p in launcher.BUILD.iterdir()) == ["cube.obj", "robotic_arm.pde"]
+
+
+@pytest.mark.parametrize("argv,expected", [
+    ([], ["--no-window"]),
+    (["--camera", "1"], ["--no-window", "--camera", "1"]),  # not mistaken for --camera-window
+    (["--camera-window", "--camera", "1"], ["--camera", "1"]),
+    (["--invert-depth", "--check"], ["--no-window", "--invert-depth"]),
+])
+def test_tracker_options_are_passed_through(argv, expected):
+    _, tracker_args = launcher.parse_args(argv)
+    assert tracker_args == expected

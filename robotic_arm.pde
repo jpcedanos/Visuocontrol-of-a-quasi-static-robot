@@ -1,16 +1,29 @@
 //-------------------GLOBAL DEFINITIONS AND SETUP-------------------//
+// One window with three panels: the main 3D view, a view from above (to judge
+// depth), and the camera preview streamed by hand_detector.py.
 
 import processing.net.*;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import javax.imageio.ImageIO;
 
 PShape base, shoulder, upArm, loArm, end, table1, cube;
-float rotX, rotY; // camera rotation of the main window (mouse drag)
+
+// Views: each is rendered off-screen, then placed in the window
+PGraphics mainView, topView;
+float mainRotX = 0, mainRotY = 0;     // front view, like the original sketch
+float topRotX = -0.75, topRotY = 0.55; // elevated view from the side
+int dragging = -1;                    // which view the mouse is rotating: 0 main, 1 top
+final int M = 8;                      // gap between panels, in pixels
+int[] mainRect, topRect, camRect;     // x, y, w, h of each panel
 
 // Arm: link lengths and joint angles (3 joints: base yaw, shoulder, elbow)
 final float F = 50;
 final float T = 70;
 float alpha, beta, gamma;
 
-// Target from the hand tracker, in arm coordinates. With the default view:
+// Target from the hand tracker, in arm coordinates. With the front view:
 // coordX points toward the viewer, coordY to the right, coordZ down.
 float coordX, coordY, coordZ;
 boolean grabbed = false;    // the hand is pinching
@@ -35,25 +48,34 @@ final float GRAVITY = 1500;   // scene units per second squared
 final float BOUNCE = 0.25;    // fraction of speed kept when the cube lands
 int lastMillis;
 
-// Network
-Client client;
+// Network: control lines on serverPort, camera frames on serverPort + 1
+Client client, video;
 String serverIP = "127.0.0.1";
 int serverPort = 65432;
-int lastConnectAttempt = 0;
+int lastConnectAttempt = 0, lastVideoAttempt = 0;
 final int RECONNECT_MS = 2000;
+byte[] videoBuffer = new byte[0];
+PImage cameraImage;
+int lastFrameMillis = -100000;
+String toast = "";
+int toastUntil = 0;
+
+void settings() {
+  // Fill most of the screen; the window can be resized or maximized
+  size(max(960, min(1600, displayWidth - 80)), max(600, min(900, displayHeight - 140)), P3D);
+  smooth(4);
+}
 
 void setup() {
-  size(800, 800, P3D);
   surface.setResizable(true);
-  surface.setTitle("robotic_arm (r: reset cube)");
+  surface.setTitle("Visuocontrol");
+  surface.setLocation(max(0, (displayWidth - width) / 2), max(0, (displayHeight - height) / 2 - 30));
+  textFont(createFont("SansSerif", 14));
 
   initializeShapes();
   connect();
+  connectVideo();
   lastMillis = millis();
-
-  // Second window with its own camera angle
-  DuplicateWindow duplicate = new DuplicateWindow();
-  PApplet.runSketch(new String[]{"DuplicateWindow"}, duplicate);
 }
 
 //-------------------MAIN LIFECYCLE FUNCTIONS-------------------//
@@ -64,18 +86,53 @@ void draw() {
   lastMillis = now;
 
   handleClientData();
+  handleVideo();
   IK();
   updateCube(dt);
-  drawWorld(this, rotX, rotY);
+
+  layoutPanels();
+  mainView = renderView(mainView, mainRect, mainRotX, mainRotY, 1.2);
+  topView = renderView(topView, topRect, topRotX, topRotY, 1.0);
+
+  background(18);
+  hint(DISABLE_DEPTH_TEST); // everything below is flat 2D on top of the views
+  image(mainView, mainRect[0], mainRect[1]);
+  image(topView, topRect[0], topRect[1]);
+  drawCameraPanel();
+  panelLabel(mainRect, "Front view");
+  panelLabel(topRect, "View from above: depth");
+  panelLabel(camRect, "Camera");
+  drawStatusBar();
+  hint(ENABLE_DEPTH_TEST);
+}
+
+void mousePressed() {
+  dragging = inside(mainRect, mouseX, mouseY) ? 0 : inside(topRect, mouseX, mouseY) ? 1 : -1;
+}
+
+void mouseReleased() {
+  dragging = -1;
 }
 
 void mouseDragged() {
-  rotY -= (mouseX - pmouseX) * 0.01;
-  rotX -= (mouseY - pmouseY) * 0.01;
+  float dx = (mouseX - pmouseX) * 0.01, dy = (mouseY - pmouseY) * 0.01;
+  if (dragging == 0) { mainRotY -= dx; mainRotX -= dy; }
+  if (dragging == 1) { topRotY -= dx; topRotX -= dy; }
 }
 
 void keyPressed() {
-  if (key == 'r' || key == 'R') resetCube();
+  if (key == 'r' || key == 'R') {
+    resetCube();
+    showToast("Cube reset");
+  }
+  if (key == 'c' || key == 'C') {
+    if (client != null && client.active()) {
+      client.write("recenter\n"); // the tracker re-centers depth at the hand's current distance
+      showToast("Depth re-centered at your hand's current distance");
+    } else {
+      showToast("Hand tracker not connected");
+    }
+  }
 }
 
 //-------------------INITIALIZATION FUNCTIONS-------------------//
@@ -102,19 +159,117 @@ void resetCube() {
   holding = false;
 }
 
-//-------------------RENDERING FUNCTIONS-------------------//
-// Both windows draw the same scene through these functions; p is the window.
+//-------------------LAYOUT AND 2D PANELS-------------------//
 
-void drawWorld(PApplet p, float rx, float ry) {
+void layoutPanels() {
+  int colW = constrain(int(width * 0.32), 300, 560);
+  int colH = (height - 3 * M) / 2;
+  mainRect = new int[] {M, M, width - colW - 3 * M, height - 2 * M};
+  topRect = new int[] {width - colW - M, M, colW, colH};
+  camRect = new int[] {width - colW - M, 2 * M + colH, colW, height - 3 * M - colH};
+}
+
+boolean inside(int[] r, int x, int y) {
+  return x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3];
+}
+
+// Draw the scene into an off-screen buffer the size of the panel
+PGraphics renderView(PGraphics pg, int[] r, float rx, float ry, float zoom) {
+  if (pg == null || pg.width != r[2] || pg.height != r[3]) {
+    pg = createGraphics(max(1, r[2]), max(1, r[3]), P3D);
+  }
+  pg.beginDraw();
+  drawWorld(pg, rx, ry, zoom);
+  pg.endDraw();
+  return pg;
+}
+
+void drawCameraPanel() {
+  int[] r = camRect;
+  noStroke();
+  fill(26);
+  rect(r[0], r[1], r[2], r[3]);
+  boolean fresh = cameraImage != null && millis() - lastFrameMillis < 2000;
+  if (fresh) {
+    // Fit the image inside the panel, keeping its aspect ratio
+    float s = min(r[2] / (float) cameraImage.width, r[3] / (float) cameraImage.height);
+    float w = cameraImage.width * s, h = cameraImage.height * s;
+    image(cameraImage, r[0] + (r[2] - w) / 2, r[1] + (r[3] - h) / 2, w, h);
+  } else {
+    fill(150);
+    textAlign(CENTER, CENTER);
+    boolean tracker = client != null && client.active();
+    text(tracker ? "Waiting for the camera..." : "Hand tracker not running.\nStart it with Launch.bat",
+         r[0] + r[2] / 2, r[1] + r[3] / 2);
+    textAlign(LEFT, BASELINE);
+  }
+}
+
+void panelLabel(int[] r, String label) {
+  noStroke();
+  fill(0, 150);
+  rect(r[0], r[1], textWidth(label) + 16, 24);
+  fill(230);
+  text(label, r[0] + 8, r[1] + 17);
+}
+
+void drawStatusBar() {
+  int[] r = mainRect;
+  int h = 34, y = r[1] + r[3] - h;
+  noStroke();
+  fill(0, 170);
+  rect(r[0], y, r[2], h);
+
+  boolean tracker = client != null && client.active();
+  String state;
+  if (!tracker) {
+    fill(255, 110, 90);
+    state = "Hand tracker not connected";
+  } else if (holding) {
+    fill(110, 230, 120);
+    state = "Holding the cube";
+  } else if (grabbed) {
+    fill(255, 190, 80);
+    state = "Pinching (not at the cube)";
+  } else {
+    fill(220);
+    state = "Pinch at the cube to grab it";
+  }
+  text(state, r[0] + 12, y + 22);
+
+  fill(170);
+  String help = "c: re-center depth    r: reset cube    drag: rotate a view";
+  text(help, r[0] + r[2] - textWidth(help) - 12, y + 22);
+
+  if (millis() < toastUntil) {
+    float w = textWidth(toast) + 24;
+    fill(0, 200);
+    rect(r[0] + (r[2] - w) / 2, r[1] + 14, w, 30, 6);
+    fill(255);
+    textAlign(CENTER, CENTER);
+    text(toast, r[0] + r[2] / 2, r[1] + 29);
+    textAlign(LEFT, BASELINE);
+  }
+}
+
+void showToast(String message) {
+  toast = message;
+  toastUntil = millis() + 1800;
+}
+
+//-------------------3D RENDERING FUNCTIONS-------------------//
+// Both views draw the same scene through these functions; p is the view's buffer.
+
+void drawWorld(PGraphics p, float rx, float ry, float zoom) {
   p.background(32);
   p.lights();
   p.directionalLight(51, 102, 126, -1, 0, 0);
   p.noStroke();
 
-  p.translate(p.width / 2, p.height / 2);
+  p.translate(p.width / 2, p.height * 0.55);
   p.rotateX(rx);
   p.rotateY(-ry);
-  p.scale(-4);
+  p.scale(-4 * zoom * min(p.width, p.height) / 800.0); // the original 800x800 window used scale(-4)
 
   drawFloor(p);
   drawShadows(p);
@@ -123,34 +278,34 @@ void drawWorld(PApplet p, float rx, float ry) {
   drawRoboticArm(p);
 }
 
-void drawFloor(PApplet p) {
+void drawFloor(PGraphics p) {
   p.pushMatrix();
   p.translate(0, FLOOR_Y - 0.5, 0);
-  p.fill(48);
+  p.fill(78);
   p.box(260, 1, 160);
   p.popMatrix();
 }
 
 // Dark squares straight below the cube and the arm tip, on whatever surface is
 // underneath. They make it much easier to judge depth with one hand.
-void drawShadows(PApplet p) {
-  p.fill(15, 15, 15);
+void drawShadows(PGraphics p) {
+  p.fill(20);
   float cubeGround = supportHeight(posX, posZ);
   if (posY > cubeGround + 0.5) {
     flatSquare(p, posX, cubeGround, posZ, CUBE_HALF * 2);
   }
-  p.fill(120, 40, 120);
-  flatSquare(p, tipX, supportHeight(tipX, tipZ), tipZ, 3);
+  p.fill(200, 60, 200);
+  flatSquare(p, tipX, supportHeight(tipX, tipZ), tipZ, 4);
 }
 
-void flatSquare(PApplet p, float x, float y, float z, float size) {
+void flatSquare(PGraphics p, float x, float y, float z, float size) {
   p.pushMatrix();
   p.translate(x, y + 0.15, z);
   p.box(size, 0.1, size);
   p.popMatrix();
 }
 
-void drawTables(PApplet p) {
+void drawTables(PGraphics p) {
   p.pushMatrix();
   p.scale(0.25);
   p.shape(table1, -250, -200);
@@ -162,7 +317,7 @@ void drawTables(PApplet p) {
   p.popMatrix();
 }
 
-void drawCube(PApplet p) {
+void drawCube(PGraphics p) {
   p.pushMatrix();
   p.translate(posX, posY, posZ);
   p.scale(0.75);
@@ -170,7 +325,7 @@ void drawCube(PApplet p) {
   p.popMatrix();
 }
 
-void drawRoboticArm(PApplet p) {
+void drawRoboticArm(PGraphics p) {
   p.fill(#FFE308);
   p.translate(0, -40, 0);
   if (base != null) p.shape(base);
@@ -199,6 +354,57 @@ void drawRoboticArm(PApplet p) {
 void connect() {
   client = new Client(this, serverIP, serverPort);
   lastConnectAttempt = millis();
+}
+
+void connectVideo() {
+  video = new Client(this, serverIP, serverPort + 1);
+  videoBuffer = new byte[0];
+  lastVideoAttempt = millis();
+}
+
+// Camera frames arrive as a 4-byte big-endian length followed by a JPEG.
+// Collect bytes, cut out whole frames, and show only the newest one.
+void handleVideo() {
+  if (video == null || !video.active()) {
+    if (millis() - lastVideoAttempt > RECONNECT_MS) connectVideo();
+    return;
+  }
+  if (video.available() > 0) {
+    videoBuffer = concat(videoBuffer, video.readBytes());
+  }
+  byte[] latest = null;
+  int off = 0;
+  while (videoBuffer.length - off >= 4) {
+    int n = ((videoBuffer[off] & 0xff) << 24) | ((videoBuffer[off + 1] & 0xff) << 16)
+          | ((videoBuffer[off + 2] & 0xff) << 8) | (videoBuffer[off + 3] & 0xff);
+    if (n <= 0 || n > 5000000) { // out of sync: start over with the next data
+      videoBuffer = new byte[0];
+      return;
+    }
+    if (videoBuffer.length - off - 4 < n) break; // frame not complete yet
+    latest = subset(videoBuffer, off + 4, n);
+    off += 4 + n;
+  }
+  if (off > 0) videoBuffer = subset(videoBuffer, off);
+  if (latest != null) decodeFrame(latest);
+}
+
+void decodeFrame(byte[] jpg) {
+  try {
+    BufferedImage img = ImageIO.read(new ByteArrayInputStream(jpg));
+    if (img == null) return;
+    int w = img.getWidth(), h = img.getHeight();
+    if (cameraImage == null || cameraImage.width != w || cameraImage.height != h) {
+      cameraImage = createImage(w, h, RGB);
+    }
+    cameraImage.loadPixels();
+    img.getRGB(0, 0, w, h, cameraImage.pixels, 0, w);
+    cameraImage.updatePixels();
+    lastFrameMillis = millis();
+  }
+  catch (IOException e) {
+    // a damaged frame: skip it
+  }
 }
 
 void handleClientData() {
@@ -303,30 +509,5 @@ void updateCube(float dt) {
       velY = -velY * BOUNCE;
       if (abs(velY) < 40) velY = 0; // settle instead of bouncing forever
     }
-  }
-}
-
-//-------------------SECOND WINDOW-------------------//
-
-public class DuplicateWindow extends PApplet {
-  float rotX = -0.5, rotY = 0.6; // its own camera, starting from another angle
-
-  public void settings() {
-    size(800, 800, P3D);
-  }
-
-  public void setup() {
-    surface.setResizable(true);
-    surface.setTitle("robotic_arm (second view)");
-    initializeShapes();
-  }
-
-  public void draw() {
-    drawWorld(this, rotX, rotY);
-  }
-
-  public void mouseDragged() {
-    rotY -= (mouseX - pmouseX) * 0.01;
-    rotX -= (mouseY - pmouseY) * 0.01;
   }
 }
