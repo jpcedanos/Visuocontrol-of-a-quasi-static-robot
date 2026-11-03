@@ -1,61 +1,57 @@
-# Robotic Arm Simulation with Hand Gesture Control
+# Visuocontrol of a quasi-static robot
 
-**Description**
+Control a simulated 6-DOF robotic arm with your hand. A webcam tracks your hand with MediaPipe, and a Processing sketch moves the arm in 3D with inverse kinematics. Close your fist to grab a cube.
 
-This project simulates a robotic arm controlled by hand gestures using OpenCV and MediaPipe in Python, and rendered using Processing. The simulation shows a robotic arm in a 3D environment. The arm can move and detect if it's touching a cube in the scene. Movements and interactions are controlled by hand gestures detected through a webcam.
+<!-- Add a demo here: screen-record both windows and save it as docs/demo.gif -->
+<!-- ![Demo](docs/demo.gif) -->
 
-**Features**
+## How it works
 
-* **3D Rendering:** Utilizes Processing with OpenGL for rendering 3D shapes.
-* **Inverse Kinematics (IK):** Computes the position and orientation of the robotic arm.
-* **Client-Server Communication:** Receives hand gesture data from a Python client via TCP/IP.
-* **Gesture Detection:** Employs OpenCV and MediaPipe to detect hand gestures, such as "thumb up" and "thumb down".
-
-**Installation**
-
-**Prerequisites**
-
-* Processing (https://processing.org/)
-* Python 3 (https://www.python.org/downloads/)
-* Python packages:
-    * opencv-python
-    * mediapipe
-    * numpy
-
-**Clone the Repository**
-
-```bash
-git clone https://github.com/jpcedano/Visuocontrol-of-a-quasi-static-robot.git
-cd your-repository
+```mermaid
+flowchart LR
+    WEB[Webcam] --> PY[hand_detector.py<br/>OpenCV + MediaPipe<br/>TCP server :65432]
+    PY -- "x, y, z, fist_closed" --> PDE[robotic_arm.pde<br/>Processing 3D + IK<br/>TCP client]
 ```
 
-**Python Setup**
-Install the necessary Python packages:
-```bash
-pip install opencv-python mediapipe numpy
-```
+- **Hand tracking (`hand_detector.py`):** MediaPipe Hands finds the hand landmarks in each frame.
+  - Wrist position sets the arm's target X and Y.
+  - Thumb up or thumb down moves the target Z up or down.
+  - A closed fist is the grab signal.
+- **Streaming:** the Python script runs a TCP server on `127.0.0.1:65432` and sends `x,y,z,fist_closed` each frame.
+- **Simulation (`robotic_arm.pde`):** Processing connects as a client, solves the joint angles in closed form (law of cosines and `atan2`), and renders the arm, a table, and a cube from OBJ models. If the hand is closed while the arm touches the cube, the arm picks it up.
 
-**Usage**
+## Requirements
 
-***Run the Python Client:***
-Open a terminal and navigate to the project directory and run the script:
-```bash
-python hand_detector.py
-```
-This script initializes the webcam and starts detecting hand gestures.
+- [Processing](https://processing.org/) (uses the built-in `processing.net` library)
+- Python 3 with `opencv-python`, `mediapipe`, and `numpy`:
+  ```bash
+  pip install opencv-python mediapipe numpy
+  ```
 
-***Running the Processing Sketch:***
-Open the Processing sketch and run it.
+## Running
 
-**Controls**
+1. Clone the repo:
+   ```bash
+   git clone https://github.com/jpcedano/Visuocontrol-of-a-quasi-static-robot.git
+   cd Visuocontrol-of-a-quasi-static-robot
+   ```
+2. Start the hand tracker first, since it's the server:
+   ```bash
+   python hand_detector.py
+   ```
+3. Open `robotic_arm.pde` in Processing and press Run. It connects to the tracker and opens the 3D view.
 
-* Mouse Drag: Rotate the camera view in the Processing window.
-* Hand Gestures: Use gestures like "thumb up" and "thumb down" in your right hand to control the z-position of the robotic arm.
+`cliente_temporal.py` is a small debug client that prints the coordinate stream without the simulation.
 
-**Ackowledgements**
+## Controls
 
-* OpenCV
-* MediaPipe
-* Processing
+| Input | Effect |
+|---|---|
+| Move your wrist | Moves the arm in X and Y |
+| Thumb up / thumb down | Raises / lowers the arm (Z) |
+| Close your fist | Grabs the cube when the arm is touching it |
+| Drag the mouse | Rotates the camera in the Processing window |
 
+## Built with
 
+OpenCV · MediaPipe · Processing (OpenGL)
